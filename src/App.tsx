@@ -338,7 +338,8 @@ export default function App() {
     if (confirm('Deseja realmente EXCLUIR o grupo? Esta ação é irreversível.')) {
       socket?.emit('delete_group', {
         grupo_id: currentGroup,
-        session_token: sessionToken
+        session_token: sessionToken,
+        device_id: deviceId
       });
     }
   };
@@ -757,7 +758,7 @@ export default function App() {
               messages.map((m, idx) => {
                 const isMe = m.user === currentUser;
                 return (
-                  <div key={idx} className={`max-w-[80%5] md:max-w-[65%] p-4 rounded-2xl relative shadow-lg backdrop-blur-md border border-white/5 ${
+                  <div key={idx} className={`max-w-[85%] md:max-w-[65%] p-4 rounded-2xl relative shadow-lg backdrop-blur-md border border-white/5 ${
                     isMe ? 'ml-auto bg-gradient-to-br from-purple-600 to-cyan-500 text-white rounded-br-sm' : 'mr-auto bg-[#222228] text-white/95 rounded-bl-sm'
                   }`}>
                     <div className="font-semibold text-xs opacity-80 mb-1 flex items-center gap-1.5">
