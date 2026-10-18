@@ -35,11 +35,20 @@ A aplicação permite criar e participar de salas de conversa públicas ou priva
 1. Instale as dependências:
    ```bash
    npm install
+
+   pkg update
+   pkg install nodejs-lts git -y
+
+   npm install --legacy-peer-deps
+
+   npm install -D tsx --legacy-peer-deps
    ```
 
 2. Inicie o servidor de desenvolvimento (que executa o backend Express/Socket.io e o frontend Vite simultaneamente):
    ```bash
    npm run dev
+
+   npm run dev -- --host 0.0.0.0
    ```
 
 3. Acesse a aplicação no seu navegador:
