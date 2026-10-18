@@ -143,12 +143,13 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     for (const grupoId of Object.keys(connected_users)) {
       if (connected_users[grupoId][socket.id]) {
+        socket.leave(grupoId);
         delete connected_users[grupoId][socket.id];
         if (Object.keys(connected_users[grupoId]).length === 0) {
           delete connected_users[grupoId];
         }
         const count = Object.keys(connected_users[grupoId] || {}).length;
-        io.emit('user_count_update', { grupo_id: grupoId, count });
+        io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count });
         break;
       }
     }
@@ -207,6 +208,7 @@ io.on('connection', (socket) => {
       `);
       insertSession.run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso);
 
+      socket.join(grupoId);
       if (!connected_users[grupoId]) connected_users[grupoId] = {};
       connected_users[grupoId][socket.id] = [usuario, sessionToken, deviceId];
 
@@ -223,7 +225,7 @@ io.on('connection', (socket) => {
         message: '✅ Grupo criado com sucesso!'
       });
 
-      io.emit('user_count_update', { grupo_id: grupoId, count: 1 });
+      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: 1 });
     } catch (err: any) {
       console.error('Error creating group:', err);
       socket.emit('group_result', { success: false, msg: 'Erro ao criar grupo: ' + err.message });
@@ -311,6 +313,7 @@ io.on('connection', (socket) => {
         time: r.data_hora
       }));
 
+      socket.join(grupoId);
       if (!connected_users[grupoId]) connected_users[grupoId] = {};
       
       for (const [sId, [uName, _, dId]] of Object.entries(connected_users[grupoId])) {
@@ -334,7 +337,7 @@ io.on('connection', (socket) => {
         message: '✅ Conectado ao grupo!'
       });
 
-      io.emit('user_count_update', { grupo_id: grupoId, count: currentCount });
+      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: currentCount });
     } catch (err: any) {
       console.error('Error joining group:', err);
       socket.emit('group_result', { success: false, msg: 'Erro ao entrar no grupo: ' + err.message });
@@ -371,7 +374,7 @@ io.on('connection', (socket) => {
       `);
       insertMsg.run(group.grupo_uuid, usuario, msg, dataHora);
 
-      io.emit('receive_message', {
+      io.to(grupoId).emit('receive_message', {
         grupo_id: grupoId,
         usuario,
         msg,
@@ -388,12 +391,13 @@ io.on('connection', (socket) => {
     const deviceId = data?.device_id;
 
     if (grupoId && connected_users[grupoId] && connected_users[grupoId][socket.id]) {
+      socket.leave(grupoId);
       delete connected_users[grupoId][socket.id];
       if (Object.keys(connected_users[grupoId]).length === 0) {
         delete connected_users[grupoId];
       }
       const count = Object.keys(connected_users[grupoId] || {}).length;
-      io.emit('user_count_update', { grupo_id: grupoId, count });
+      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count });
     }
 
     if (sessionToken && deviceId) {

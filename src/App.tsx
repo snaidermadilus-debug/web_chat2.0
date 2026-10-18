@@ -43,6 +43,11 @@ export default function App() {
 
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const heartbeatIntervalRef = useRef<any>(null);
+  const currentGroupRef = useRef<string>('');
+
+  useEffect(() => {
+    currentGroupRef.current = currentGroup;
+  }, [currentGroup]);
 
   // Initialize Device ID & Socket
   useEffect(() => {
@@ -97,10 +102,10 @@ export default function App() {
     });
 
     socket.on('receive_message', (data: any) => {
-      if (data.grupo_id !== currentGroup && data.grupo_id !== localStorage.getItem('chat_session_group')) {
-        // also check if state matches
+      const activeGroup = currentGroupRef.current || localStorage.getItem('chat_session_group');
+      if (data.grupo_id === activeGroup) {
+        setMessages(prev => [...prev, { user: data.usuario, msg: data.msg, time: data.timestamp }]);
       }
-      setMessages(prev => [...prev, { user: data.usuario, msg: data.msg, time: data.timestamp }]);
     });
 
     socket.on('user_count_update', (data: any) => {
@@ -206,8 +211,26 @@ export default function App() {
           setCurrentGroup(data.grupo_id);
           setCurrentUser(data.usuario);
           setSessionToken(data.session_token);
+          const devId = data.device_id || deviceId;
           if (data.device_id) setDeviceId(data.device_id);
-          setScreen('options');
+
+          // Automatically rejoin group chat on reload
+          const doJoin = () => {
+            if (socket) {
+              socket.emit('join_group', {
+                grupo_id: data.grupo_id,
+                usuario: data.usuario,
+                session_token: data.session_token,
+                device_id: devId
+              });
+            }
+          };
+
+          if (socket && socket.connected) {
+            doJoin();
+          } else {
+            socket?.once('connect', doJoin);
+          }
         } else {
           localStorage.removeItem('chat_session');
         }
