@@ -77,6 +77,14 @@ try {
       console.warn('⚠️ SQLite note: could not drop column admin_device_id (supported in SQLite 3.35+):', dropErr?.message);
     }
   }
+
+  // Migration for sessoes: add recovery_secret_hash if missing
+  const sessTableInfo = db.prepare('PRAGMA table_info(sessoes)').all() as { cid: number; name: string; type: string }[];
+  const sessExistingCols = new Set(sessTableInfo.map(col => col.name));
+  if (!sessExistingCols.has('recovery_secret_hash')) {
+    db.exec('ALTER TABLE sessoes ADD COLUMN recovery_secret_hash TEXT');
+    console.log('✅ Migrated sessoes: added recovery_secret_hash column');
+  }
 } catch (e: any) {
   console.error('❌ Database migration error:', e?.message || e);
   process.exit(1);
@@ -98,7 +106,8 @@ db.exec(`
     usuario TEXT NOT NULL,
     device_id TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    recovery_secret_hash TEXT
   );
 `);
 
@@ -263,11 +272,13 @@ async function startServer() {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0, sessionToken, adminKey);
 
+        const recoverySecret = crypto.randomBytes(8).toString('hex');
+        const recoverySecretHash = bcrypt.hashSync(recoverySecret, 10);
         const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
         db.prepare(`
-          INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso);
+          INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso, recoverySecretHash);
 
         socket.join(grupoId);
         if (!connected_users[grupoId]) connected_users[grupoId] = {};
@@ -278,6 +289,7 @@ async function startServer() {
           grupo_id: grupoId,
           usuario,
           session_token: sessionToken,
+          recovery_secret: recoverySecret,
           device_id: deviceId,
           admin_key: adminKey,
           historico: [],
@@ -326,6 +338,7 @@ async function startServer() {
         let validUsuario = sessionToken ? validateSession(sessionToken, grupoId, auxiliaryDeviceId) : null;
         const isRestoringValidSession = Boolean(validUsuario && validUsuario.toLowerCase() === usuario.toLowerCase());
 
+        let recoverySecret: string | undefined = undefined;
         if (!isRestoringValidSession) {
           // New connection attempting to take this username: verify username is not already claimed
           if (isUsernameTaken(grupo_uuid, usuario)) {
@@ -352,10 +365,12 @@ async function startServer() {
 
           // Clean previous sessions and issue a new unpredictable, server-generated session token
           db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(grupo_uuid, usuario);
+          recoverySecret = crypto.randomBytes(8).toString('hex');
+          const recoverySecretHash = bcrypt.hashSync(recoverySecret, 10);
           activeToken = crypto.randomBytes(32).toString('hex');
           const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-          db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)`)
-            .run(activeToken, grupo_uuid, usuario, auxiliaryDeviceId, expiresAt, new Date().toISOString());
+          db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+            .run(activeToken, grupo_uuid, usuario, auxiliaryDeviceId, expiresAt, new Date().toISOString(), recoverySecretHash);
         }
 
         let isAdmin = false;
@@ -387,6 +402,7 @@ async function startServer() {
           grupo_id: grupoId,
           usuario,
           session_token: activeToken,
+          recovery_secret: recoverySecret || undefined,
           device_id: auxiliaryDeviceId,
           admin_key: isAdmin ? admin_key : undefined,
           historico: historico.map((r: any) => ({ user: r.usuario, msg: r.mensagem, time: r.data_hora })),
@@ -450,6 +466,7 @@ async function startServer() {
       const usuario = sanitizeInput(data?.usuario || '', 15);
       const password = (data?.password || '').trim();
       const adminKey = (data?.admin_key || '').trim();
+      const recoverySecret = (data?.recovery_secret || '').trim();
       const auxiliaryDeviceId = (data?.device_id || '').trim();
 
       if (!grupoId || !usuario) {
@@ -467,7 +484,7 @@ async function startServer() {
 
       // Verify ownership of the user identity: check if session exists for this user in this group
       const existingSession = db.prepare(`
-        SELECT device_id FROM sessoes 
+        SELECT device_id, recovery_secret_hash FROM sessoes 
         WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)
       `).get(group.grupo_uuid, usuario) as any;
 
@@ -477,22 +494,22 @@ async function startServer() {
         return;
       }
 
-      // Ensure the requesting device ID matches the registered session owner (preventing hijacking other participants' accounts)
-      if (existingSession.device_id && auxiliaryDeviceId && existingSession.device_id !== auxiliaryDeviceId) {
+      // Independent proof of identity: require correct personal recovery secret (or room password / admin key if private)
+      const isRecoverySecretValid = existingSession.recovery_secret_hash && recoverySecret && bcrypt.compareSync(recoverySecret, existingSession.recovery_secret_hash);
+      const isPasswordValid = group.privado && group.senha_hash && password && bcrypt.compareSync(password, group.senha_hash);
+      const isAdminKeyValid = group.admin_key && adminKey && adminKey === group.admin_key;
+
+      if (!isRecoverySecretValid && !isPasswordValid && !isAdminKeyValid) {
         recordFailedAttempt(clientIp);
-        socket.emit('recovery_result', { success: false, msg: 'Não autorizado: dispositivo não confere com o proprietário da conta.' });
+        socket.emit('recovery_result', { success: false, msg: 'Chave de recuperação pessoal (ou senha) incorreta.' });
         return;
       }
 
-      // If group is private, verify room password or admin key
-      if (group.privado) {
-        const isPasswordValid = group.senha_hash && password && bcrypt.compareSync(password, group.senha_hash);
-        const isAdminKeyValid = group.admin_key && adminKey && adminKey === group.admin_key;
-        if (!isPasswordValid && !isAdminKeyValid) {
-          recordFailedAttempt(clientIp);
-          socket.emit('recovery_result', { success: false, msg: 'Senha necessária para recuperação em sala privada.' });
-          return;
-        }
+      // Ensure the requesting device ID matches or is bound (preventing arbitrary hijacking)
+      if (existingSession.device_id && auxiliaryDeviceId && existingSession.device_id !== auxiliaryDeviceId && !isPasswordValid && !isAdminKeyValid) {
+        recordFailedAttempt(clientIp);
+        socket.emit('recovery_result', { success: false, msg: 'Não autorizado: dispositivo não confere com o proprietário da conta.' });
+        return;
       }
 
       const token = crypto.randomBytes(3).toString('hex');
@@ -519,6 +536,12 @@ async function startServer() {
         socket.emit('recovery_verified', { success: false, msg: 'Token inválido ou expirado' });
         return;
       }
+
+      if (tInfo.device_id && auxiliaryDeviceId && tInfo.device_id !== auxiliaryDeviceId) {
+        recordFailedAttempt(clientIp);
+        socket.emit('recovery_verified', { success: false, msg: 'Dispositivo inválido para este token de recuperação.' });
+        return;
+      }
       
       const group = db.prepare(`SELECT grupo_uuid, admin_key, admin_session_token FROM grupos WHERE grupo_id = ?`).get(grupo_id) as any;
       if (!group) {
@@ -530,9 +553,12 @@ async function startServer() {
       // Clear previous sessions for this user in this group
       db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(group.grupo_uuid, usuario);
       
+      const newRecoverySecret = crypto.randomBytes(8).toString('hex');
+      const newRecoverySecretHash = bcrypt.hashSync(newRecoverySecret, 10);
       const sessionToken = crypto.randomBytes(32).toString('hex');
-      db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(sessionToken, group.grupo_uuid, usuario, auxiliaryDeviceId, new Date(Date.now() + 24 * 3600 * 1000).toISOString(), new Date().toISOString());
+
+      db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(sessionToken, group.grupo_uuid, usuario, auxiliaryDeviceId, new Date(Date.now() + 24 * 3600 * 1000).toISOString(), new Date().toISOString(), newRecoverySecretHash);
 
       // Independent admin credential verification: Never promote by display name or device ID!
       let isRecoveredAdmin = false;
@@ -545,6 +571,7 @@ async function startServer() {
       socket.emit('recovery_verified', {
         success: true,
         session_token: sessionToken,
+        recovery_secret: newRecoverySecret,
         grupo_id,
         usuario,
         device_id: auxiliaryDeviceId,

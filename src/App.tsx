@@ -39,6 +39,8 @@ export default function App() {
   const [recoverPassword, setRecoverPassword] = useState<string>('');
   const [recoverToken, setRecoverToken] = useState<string>('');
   const [recoverAdminKey, setRecoverAdminKey] = useState<string>('');
+  const [recoverSecretInput, setRecoverSecretInput] = useState<string>('');
+  const [recoverySecret, setRecoverySecret] = useState<string>('');
   const [generatedToken, setGeneratedToken] = useState<string>('');
   const [showTokenSection, setShowTokenSection] = useState<boolean>(false);
 
@@ -95,8 +97,11 @@ export default function App() {
       if (data.device_id) {
         setDeviceId(data.device_id);
       }
+      if (data.recovery_secret) {
+        setRecoverySecret(data.recovery_secret);
+      }
 
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId, data.admin_key);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId, data.admin_key, data.recovery_secret);
       setScreen('chat');
 
       if (data.historico && data.historico.length > 0) {
@@ -141,8 +146,11 @@ export default function App() {
       if (data.admin_key) {
         setAdminKey(data.admin_key);
       }
+      if (data.recovery_secret) {
+        setRecoverySecret(data.recovery_secret);
+      }
       setIsAdmin(data.is_admin || false);
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id, data.admin_key);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id, data.admin_key, data.recovery_secret);
       
       socket?.emit('join_group', {
         grupo_id: data.grupo_id,
@@ -209,14 +217,22 @@ export default function App() {
     }
   };
 
-  const saveSession = (grupo: string, usuario: string, token: string, devId: string, admKey?: string) => {
+  const saveSession = (grupo: string, usuario: string, token: string, devId: string, admKey?: string, recSecret?: string) => {
     localStorage.setItem('chat_session_group', grupo);
     let currentAdminKey = admKey;
-    if (currentAdminKey === undefined) {
+    let currentRecoverySecret = recSecret;
+    if (currentAdminKey === undefined || currentRecoverySecret === undefined) {
       try {
         const prev = localStorage.getItem('chat_session');
-        if (prev) currentAdminKey = JSON.parse(prev).admin_key;
+        if (prev) {
+          const parsed = JSON.parse(prev);
+          if (currentAdminKey === undefined) currentAdminKey = parsed.admin_key;
+          if (currentRecoverySecret === undefined) currentRecoverySecret = parsed.recovery_secret;
+        }
       } catch (e) {}
+    }
+    if (currentRecoverySecret) {
+      setRecoverySecret(currentRecoverySecret);
     }
     localStorage.setItem('chat_session', JSON.stringify({
       grupo_id: grupo,
@@ -224,6 +240,7 @@ export default function App() {
       session_token: token,
       device_id: devId,
       admin_key: currentAdminKey || '',
+      recovery_secret: currentRecoverySecret || '',
       timestamp: Date.now()
     }));
   };
@@ -240,6 +257,9 @@ export default function App() {
           setSessionToken(data.session_token);
           if (data.admin_key) {
             setAdminKey(data.admin_key);
+          }
+          if (data.recovery_secret) {
+            setRecoverySecret(data.recovery_secret);
           }
           const devId = data.device_id || deviceId;
           if (data.device_id) setDeviceId(data.device_id);
@@ -323,6 +343,7 @@ export default function App() {
       usuario: recoverNome.trim(),
       password: recoverPassword,
       admin_key: recoverAdminKey.trim() || undefined,
+      recovery_secret: recoverSecretInput.trim() || undefined,
       device_id: deviceId
     });
   };
@@ -695,6 +716,18 @@ export default function App() {
                 />
               </div>
 
+              <div>
+                <label className="block text-white/90 font-semibold mb-1 text-sm">Chave de Recuperação Pessoal <span className="text-pink-400">*</span></label>
+                <p className="text-[11px] text-white/50 mb-2">Informe a chave secreta fornecida a você ao entrar no grupo (prova de identidade).</p>
+                <input
+                  type="text"
+                  value={recoverSecretInput}
+                  onChange={e => setRecoverSecretInput(e.target.value)}
+                  placeholder="Sua chave pessoal de recuperação"
+                  className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all font-mono"
+                />
+              </div>
+
               {!showTokenSection ? (
                 <button
                   onClick={handleRequestRecovery}
@@ -798,6 +831,19 @@ export default function App() {
                 >
                   <Copy className="w-3.5 h-3.5 text-amber-300" />
                   <span>Chave Admin</span>
+                </button>
+              )}
+              {recoverySecret && (
+                <button
+                  onClick={() => {
+                    navigator.clipboard?.writeText(recoverySecret);
+                    showNotification('Chave de Recuperação Pessoal copiada!', 'success');
+                  }}
+                  title="Copiar chave de recuperação pessoal"
+                  className="hidden sm:flex items-center gap-1.5 bg-pink-500/10 hover:bg-pink-500/20 border border-pink-500/30 text-pink-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
+                >
+                  <Key className="w-3.5 h-3.5 text-pink-300" />
+                  <span>Chave Pessoal</span>
                 </button>
               )}
               {isAdmin && (
