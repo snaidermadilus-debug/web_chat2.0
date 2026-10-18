@@ -100,7 +100,7 @@ function validateSession(sessionToken: string, grupoId: string, deviceId: string
       AND s.expires_at > ?
   `);
   const nowIso = new Date().toISOString();
-  const row = stmt.get(sessionToken, grupoId, deviceId) as { usuario: string } | undefined;
+  const row = stmt.get(sessionToken, grupoId, deviceId, nowIso) as { usuario: string } | undefined;
 
   if (row) {
     const updateStmt = db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`);
