@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# SQLite database
+chat_database.db
+*.db

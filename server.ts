@@ -33,7 +33,7 @@ const PORT = process.env.PORT || 3000;
 const dbPath = path.join(process.cwd(), 'chat_database.db');
 const db = new DatabaseSync(dbPath);
 
-// Initialize tables
+// Initialize tables first so all tables exist before migrations
 db.exec(`
   CREATE TABLE IF NOT EXISTS grupos (
     grupo_uuid TEXT PRIMARY KEY,
@@ -44,6 +44,25 @@ db.exec(`
     privado BOOLEAN DEFAULT 0,
     admin_session_token TEXT,
     admin_key TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS mensagens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grupo_uuid TEXT NOT NULL,
+    usuario TEXT NOT NULL,
+    mensagem TEXT NOT NULL,
+    data_hora TEXT NOT NULL,
+    FOREIGN KEY (grupo_uuid) REFERENCES grupos(grupo_uuid) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS sessoes (
+    session_token TEXT PRIMARY KEY,
+    grupo_uuid TEXT NOT NULL,
+    usuario TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    recovery_secret_hash TEXT
   );
 `);
 
@@ -89,27 +108,6 @@ try {
   console.error('❌ Database migration error:', e?.message || e);
   process.exit(1);
 }
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS mensagens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    grupo_uuid TEXT NOT NULL,
-    usuario TEXT NOT NULL,
-    mensagem TEXT NOT NULL,
-    data_hora TEXT NOT NULL,
-    FOREIGN KEY (grupo_uuid) REFERENCES grupos(grupo_uuid) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS sessoes (
-    session_token TEXT PRIMARY KEY,
-    grupo_uuid TEXT NOT NULL,
-    usuario TEXT NOT NULL,
-    device_id TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL,
-    recovery_secret_hash TEXT
-  );
-`);
 
 console.log('✅ SQLite Database initialized at:', dbPath);
 
