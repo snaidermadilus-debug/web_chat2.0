@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { MessageSquare, Shield, Users, Key, LogOut, ArrowRight, ArrowLeft, Send, CheckCircle, AlertCircle, PlusCircle, Lock, RefreshCw, UserCheck } from 'lucide-react';
+import { MessageSquare, Shield, Users, Key, LogOut, ArrowRight, ArrowLeft, Send, CheckCircle, AlertCircle, PlusCircle, Lock, RefreshCw, UserCheck, Copy } from 'lucide-react';
 
 let socket: Socket | null = null;
 
@@ -20,6 +20,7 @@ export default function App() {
   const [sessionToken, setSessionToken] = useState<string>('');
   const [isPrivate, setIsPrivate] = useState<boolean>(false);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [adminKey, setAdminKey] = useState<string>('');
   const [userCount, setUserCount] = useState<number>(0);
   const [messages, setMessages] = useState<Message[]>([]);
   
@@ -35,7 +36,9 @@ export default function App() {
 
   const [recoverGrupo, setRecoverGrupo] = useState<string>('');
   const [recoverNome, setRecoverNome] = useState<string>('');
+  const [recoverPassword, setRecoverPassword] = useState<string>('');
   const [recoverToken, setRecoverToken] = useState<string>('');
+  const [recoverAdminKey, setRecoverAdminKey] = useState<string>('');
   const [generatedToken, setGeneratedToken] = useState<string>('');
   const [showTokenSection, setShowTokenSection] = useState<boolean>(false);
 
@@ -86,11 +89,14 @@ export default function App() {
       setSessionToken(data.session_token);
       setIsPrivate(data.is_private || false);
       setIsAdmin(data.is_admin || false);
+      if (data.admin_key) {
+        setAdminKey(data.admin_key);
+      }
       if (data.device_id) {
         setDeviceId(data.device_id);
       }
 
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId, data.admin_key);
       setScreen('chat');
 
       if (data.historico && data.historico.length > 0) {
@@ -132,13 +138,18 @@ export default function App() {
       setCurrentGroup(data.grupo_id);
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id);
+      if (data.admin_key) {
+        setAdminKey(data.admin_key);
+      }
+      setIsAdmin(data.is_admin || false);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id, data.admin_key);
       
       socket?.emit('join_group', {
         grupo_id: data.grupo_id,
         usuario: data.usuario,
         session_token: data.session_token,
-        device_id: data.device_id
+        device_id: data.device_id,
+        admin_key: data.admin_key
       });
     });
 
@@ -198,13 +209,21 @@ export default function App() {
     }
   };
 
-  const saveSession = (grupo: string, usuario: string, token: string, devId: string) => {
+  const saveSession = (grupo: string, usuario: string, token: string, devId: string, admKey?: string) => {
     localStorage.setItem('chat_session_group', grupo);
+    let currentAdminKey = admKey;
+    if (currentAdminKey === undefined) {
+      try {
+        const prev = localStorage.getItem('chat_session');
+        if (prev) currentAdminKey = JSON.parse(prev).admin_key;
+      } catch (e) {}
+    }
     localStorage.setItem('chat_session', JSON.stringify({
       grupo_id: grupo,
       usuario,
       session_token: token,
       device_id: devId,
+      admin_key: currentAdminKey || '',
       timestamp: Date.now()
     }));
   };
@@ -219,6 +238,9 @@ export default function App() {
           setCurrentGroup(data.grupo_id);
           setCurrentUser(data.usuario);
           setSessionToken(data.session_token);
+          if (data.admin_key) {
+            setAdminKey(data.admin_key);
+          }
           const devId = data.device_id || deviceId;
           if (data.device_id) setDeviceId(data.device_id);
 
@@ -229,7 +251,8 @@ export default function App() {
                 grupo_id: data.grupo_id,
                 usuario: data.usuario,
                 session_token: data.session_token,
-                device_id: devId
+                device_id: devId,
+                admin_key: data.admin_key || undefined
               });
             }
           };
@@ -252,6 +275,9 @@ export default function App() {
     setCurrentGroup('');
     setCurrentUser('');
     setSessionToken('');
+    setAdminKey('');
+    setIsAdmin(false);
+    setUserCount(0);
     setMessages([]);
     localStorage.removeItem('chat_session');
     localStorage.removeItem('chat_session_group');
@@ -289,26 +315,29 @@ export default function App() {
 
   const handleRequestRecovery = () => {
     if (!recoverGrupo.trim() || !recoverNome.trim()) {
-      showNotification('Preencha os campos', 'error');
+      showNotification('Preencha os campos obrigatórios', 'error');
       return;
     }
     socket?.emit('request_recovery', {
       grupo_id: recoverGrupo.trim(),
       usuario: recoverNome.trim(),
+      password: recoverPassword,
+      admin_key: recoverAdminKey.trim() || undefined,
       device_id: deviceId
     });
   };
 
   const handleVerifyRecovery = () => {
     if (!recoverToken.trim() || !recoverGrupo.trim() || !recoverNome.trim()) {
-      showNotification('Preencha todos os campos', 'error');
+      showNotification('Preencha todos os campos obrigatórios', 'error');
       return;
     }
     socket?.emit('verify_recovery', {
       token: recoverToken.trim(),
       grupo_id: recoverGrupo.trim(),
       usuario: recoverNome.trim(),
-      device_id: deviceId
+      device_id: deviceId,
+      admin_key: recoverAdminKey.trim() || undefined
     });
   };
 
@@ -339,7 +368,8 @@ export default function App() {
       socket?.emit('delete_group', {
         grupo_id: currentGroup,
         session_token: sessionToken,
-        device_id: deviceId
+        device_id: deviceId,
+        admin_key: adminKey || undefined
       });
     }
   };
@@ -654,6 +684,17 @@ export default function App() {
                 />
               </div>
 
+              <div>
+                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha do Grupo <span className="text-white/40 font-normal">(se a sala for privada)</span></label>
+                <input
+                  type="password"
+                  value={recoverPassword}
+                  onChange={e => setRecoverPassword(e.target.value)}
+                  placeholder="Senha da sala (opcional se pública)"
+                  className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all"
+                />
+              </div>
+
               {!showTokenSection ? (
                 <button
                   onClick={handleRequestRecovery}
@@ -681,6 +722,18 @@ export default function App() {
                       placeholder="6 dígitos"
                       maxLength={6}
                       className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white font-mono text-center text-xl tracking-widest placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-white/90 font-semibold mb-1 text-sm">Chave de Administrador <span className="text-white/40 font-normal">(opcional)</span></label>
+                    <p className="text-[11px] text-white/50 mb-2">Para recuperar os privilégios de administrador do grupo, informe a chave segura gerada na criação.</p>
+                    <input
+                      type="text"
+                      value={recoverAdminKey}
+                      onChange={e => setRecoverAdminKey(e.target.value)}
+                      placeholder="Chave recebida na criação do grupo"
+                      className="w-full p-3.5 bg-[#28282d] border border-white/10 rounded-2xl text-white font-mono text-xs placeholder-white/30 focus:outline-none focus:border-purple-500 transition-all"
                     />
                   </div>
 
@@ -723,15 +776,34 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3">
               <div className="hidden sm:flex items-center gap-2 bg-purple-500/10 px-4 py-2 rounded-2xl border border-purple-500/30 text-sm font-medium">
                 <span>👤</span>
                 <span>{currentUser}</span>
               </div>
               {isAdmin && (
+                <div className="flex items-center gap-1.5 bg-amber-500/15 px-3 py-1.5 rounded-xl border border-amber-500/30 text-xs font-semibold text-amber-300">
+                  <span>👑</span>
+                  <span>Admin</span>
+                </div>
+              )}
+              {isAdmin && adminKey && (
+                <button
+                  onClick={() => {
+                    navigator.clipboard?.writeText(adminKey);
+                    showNotification('Chave de Administrador copiada!', 'success');
+                  }}
+                  title="Copiar chave de recuperação do administrador"
+                  className="hidden md:flex items-center gap-1.5 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5 text-amber-300" />
+                  <span>Chave Admin</span>
+                </button>
+              )}
+              {isAdmin && (
                 <button
                   onClick={handleDeleteGroup}
-                  className="bg-white/10 hover:bg-red-600/30 border border-white/15 hover:border-red-500/40 text-red-200 px-4 py-2.5 rounded-xl font-medium text-sm flex items-center gap-2 transition-all group"
+                  className="bg-red-500/10 hover:bg-red-600/30 border border-red-500/30 hover:border-red-500/50 text-red-200 px-4 py-2 rounded-xl font-medium text-sm flex items-center gap-2 transition-all cursor-pointer"
                 >
                   <LogOut className="w-4 h-4 text-red-300" />
                   <span>Excluir Grupo</span>
