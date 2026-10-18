@@ -14,7 +14,13 @@ const io = new Server(httpServer, {
   cors: {
     origin: allowedOrigin 
       ? (allowedOrigin.includes(',') ? allowedOrigin.split(',').map(s => s.trim()) : allowedOrigin)
-      : true,
+      : (origin, callback) => {
+          if (!origin) return callback(null, true);
+          if (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('.run.app')) {
+            return callback(null, true);
+          }
+          callback(null, false);
+        },
     methods: ['GET', 'POST'],
     credentials: true
   },
@@ -427,16 +433,11 @@ async function startServer() {
     });
 
     socket.on('heartbeat', (data) => {
-      const { session_token, device_id } = data;
+      const { session_token } = data;
       if (session_token) {
         const nowIso = new Date().toISOString();
-        if (device_id) {
-          db.prepare(`UPDATE sessoes SET last_seen = ?, device_id = ? WHERE session_token = ?`)
-            .run(nowIso, device_id, session_token);
-        } else {
-          db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`)
-            .run(nowIso, session_token);
-        }
+        db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`)
+          .run(nowIso, session_token);
       }
     });
 
@@ -461,6 +462,25 @@ async function startServer() {
       if (!group) {
         recordFailedAttempt(clientIp);
         socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
+        return;
+      }
+
+      // Verify ownership of the user identity: check if session exists for this user in this group
+      const existingSession = db.prepare(`
+        SELECT device_id FROM sessoes 
+        WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)
+      `).get(group.grupo_uuid, usuario) as any;
+
+      if (!existingSession) {
+        recordFailedAttempt(clientIp);
+        socket.emit('recovery_result', { success: false, msg: 'Usuário não encontrado neste grupo.' });
+        return;
+      }
+
+      // Ensure the requesting device ID matches the registered session owner (preventing hijacking other participants' accounts)
+      if (existingSession.device_id && auxiliaryDeviceId && existingSession.device_id !== auxiliaryDeviceId) {
+        recordFailedAttempt(clientIp);
+        socket.emit('recovery_result', { success: false, msg: 'Não autorizado: dispositivo não confere com o proprietário da conta.' });
         return;
       }
 
