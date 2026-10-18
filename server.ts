@@ -20,9 +20,7 @@ const io = new Server(httpServer, {
 const PORT = process.env.PORT || 3000;
 
 // Database setup
-const dbDir = path.join(process.env.HOME || '.', '.cache', '.chatdata');
-fs.mkdirSync(dbDir, { recursive: true });
-const dbPath = path.join(dbDir, '.x9a_final.db');
+const dbPath = path.join(process.cwd(), 'chat_database.db');
 
 const db = new DatabaseSync(dbPath);
 
