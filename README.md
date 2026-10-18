@@ -53,7 +53,11 @@ A aplicação permite criar e participar de salas de conversa públicas ou priva
 
 3. Acesse a aplicação no seu navegador:
    ```text
-   http://localhost:3000
+   http://coloca o seu IP.:3000
+
+   por exemplo.
+   ...text
+   http://192.168.?.?.:3000
    ```
 
 ---
