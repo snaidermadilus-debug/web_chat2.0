@@ -150,6 +150,12 @@ export default function App() {
       }
     });
 
+    socket.on('group_deleted', (data: any) => {
+      resetChatState();
+      setScreen('options');
+      showNotification(data.msg || 'Grupo excluído pelo administrador.', 'info');
+    });
+
     // Restore session check
     restoreSession();
 
@@ -324,6 +330,15 @@ export default function App() {
         grupo_id: currentGroup,
         session_token: sessionToken,
         device_id: deviceId
+      });
+    }
+  };
+
+  const handleDeleteGroup = () => {
+    if (confirm('Deseja realmente EXCLUIR o grupo? Esta ação é irreversível.')) {
+      socket?.emit('delete_group', {
+        grupo_id: currentGroup,
+        session_token: sessionToken
       });
     }
   };
@@ -712,6 +727,15 @@ export default function App() {
                 <span>👤</span>
                 <span>{currentUser}</span>
               </div>
+              {isAdmin && (
+                <button
+                  onClick={handleDeleteGroup}
+                  className="bg-white/10 hover:bg-red-600/30 border border-white/15 hover:border-red-500/40 text-red-200 px-4 py-2.5 rounded-xl font-medium text-sm flex items-center gap-2 transition-all group"
+                >
+                  <LogOut className="w-4 h-4 text-red-300" />
+                  <span>Excluir Grupo</span>
+                </button>
+              )}
               <button
                 onClick={handleLeaveGroup}
                 className="bg-white/10 hover:bg-red-500/20 border border-white/15 hover:border-red-500/40 text-white px-4 py-2.5 rounded-xl font-medium text-sm flex items-center gap-2 transition-all group"

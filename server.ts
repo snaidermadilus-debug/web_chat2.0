@@ -11,7 +11,7 @@ const app = express();
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
     methods: ['GET', 'POST']
   },
   transports: ['polling', 'websocket']
@@ -21,7 +21,6 @@ const PORT = process.env.PORT || 3000;
 
 // Database setup
 const dbPath = path.join(process.cwd(), 'chat_database.db');
-
 const db = new DatabaseSync(dbPath);
 
 // Initialize tables
@@ -35,7 +34,21 @@ db.exec(`
     privado BOOLEAN DEFAULT 0
   );
 `);
-try { db.exec('ALTER TABLE grupos ADD COLUMN admin_device_id TEXT'); } catch(e) {}
+
+// Migration: Add admin_session_token if it doesn't exist
+try {
+  const tableInfo = db.prepare('PRAGMA table_info(grupos)').all() as any[];
+  const hasColumn = tableInfo.some(col => col.name === 'admin_session_token');
+  if (!hasColumn) {
+    db.exec('ALTER TABLE grupos ADD COLUMN admin_session_token TEXT');
+    console.log('✅ Migrated grupos: added admin_session_token');
+  }
+} catch (e) {
+  console.error('❌ Migration error:', e);
+  process.exit(1);
+}
+
+try { db.exec('ALTER TABLE grupos DROP COLUMN admin_device_id'); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS mensagens (
@@ -60,10 +73,10 @@ db.exec(`
 console.log('✅ SQLite Database initialized at:', dbPath);
 
 // In-memory state
-const connected_users: Record<string, Record<string, [string, string, string]>> = {}; // {grupo_id: {sid: (usuario, session_token, device_id)}}
+const connected_users: Record<string, Record<string, [string, string, string]>> = {}; 
 const temp_tokens: Record<string, { grupo_id: string; usuario: string; device_id: string; expires: Date }> = {};
 const failed_attempts: Record<string, [number, Date]> = {};
-const INACTIVITY_TIMEOUT = 10; // minutes
+const INACTIVITY_TIMEOUT = 24 * 60; // 24 hours
 
 function sanitizeInput(text: string, maxLength = 500): string {
   if (!text) return '';
@@ -76,20 +89,24 @@ function sanitizeInput(text: string, maxLength = 500): string {
   return text;
 }
 
-function checkRateLimit(ip: string): boolean {
+function recordFailedAttempt(ip: string) {
   const now = new Date();
   if (!failed_attempts[ip]) {
-    failed_attempts[ip] = [0, now];
+    failed_attempts[ip] = [1, now];
+  } else {
+    failed_attempts[ip][0] += 1;
   }
+}
+
+function checkRateLimit(ip: string): boolean {
+  const now = new Date();
+  if (!failed_attempts[ip]) return true;
   const [count, resetTime] = failed_attempts[ip];
   if (now.getTime() > resetTime.getTime() + 15 * 60 * 1000) {
     failed_attempts[ip] = [0, now];
     return true;
   }
-  if (count >= 10) {
-    return false;
-  }
-  return true;
+  return count < 10;
 }
 
 function validateSession(sessionToken: string, grupoId: string, deviceId: string): string | null {
@@ -136,408 +153,198 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// Socket.io handlers
-io.on('connection', (socket) => {
-  const clientIp = socket.handshake.address || '127.0.0.1';
-  console.log(`✅ Client connected: ${socket.id} (${clientIp})`);
-
-  socket.on('disconnect', () => {
-    for (const grupoId of Object.keys(connected_users)) {
-      if (connected_users[grupoId][socket.id]) {
-        socket.leave(grupoId);
-        delete connected_users[grupoId][socket.id];
-        if (Object.keys(connected_users[grupoId]).length === 0) {
-          delete connected_users[grupoId];
+async function startServer() {
+  io.on('connection', (socket) => {
+    const clientIp = socket.handshake.address || '127.0.0.1';
+    
+    socket.on('disconnect', () => {
+      for (const grupoId of Object.keys(connected_users)) {
+        if (connected_users[grupoId][socket.id]) {
+          socket.leave(grupoId);
+          delete connected_users[grupoId][socket.id];
+          if (Object.keys(connected_users[grupoId]).length === 0) delete connected_users[grupoId];
+          const count = Object.keys(connected_users[grupoId] || {}).length;
+          io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count });
+          break;
         }
-        const count = Object.keys(connected_users[grupoId] || {}).length;
-        io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count });
-        break;
       }
-    }
-  });
+    });
 
-  socket.on('create_group', (data) => {
-    if (!checkRateLimit(clientIp)) {
-      socket.emit('group_result', { success: false, msg: 'Muitas tentativas. Aguarde 15 minutos.' });
-      return;
-    }
+    socket.on('create_group', (data) => {
+      if (!checkRateLimit(clientIp)) {
+        socket.emit('group_result', { success: false, msg: 'Muitas tentativas. Aguarde 15 minutos.' });
+        return;
+      }
+      const grupoId = sanitizeInput(data?.grupo_id || '', 10);
+      const usuario = sanitizeInput(data?.usuario || '', 15);
+      const password = (data?.password || '').trim();
+      const isPrivate = Boolean(data?.private);
+      const deviceId = (data?.device_id || '').trim();
 
-    const grupoId = sanitizeInput(data?.grupo_id || '', 10);
-    const usuario = sanitizeInput(data?.usuario || '', 15);
-    const password = (data?.password || '').trim();
-    const isPrivate = Boolean(data?.private);
-    const deviceId = (data?.device_id || '').trim();
-
-    if (!deviceId) {
-      socket.emit('group_result', { success: false, msg: 'Device ID necessário' });
-      return;
-    }
-
-    if (!grupoId || !usuario) {
-      socket.emit('group_result', { success: false, msg: 'Dados inválidos' });
-      return;
-    }
-
-    if (!/^[a-zA-Z0-9_-]{1,10}$/.test(grupoId)) {
-      socket.emit('group_result', { success: false, msg: 'ID do grupo inválido (máx 10 chars, sem espaços)' });
-      return;
-    }
-
-    try {
-      const checkStmt = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`);
-      if (checkStmt.get(grupoId)) {
-        socket.emit('group_result', { success: false, msg: 'Grupo já existe' });
+      if (!deviceId || !grupoId || !usuario) {
+        socket.emit('group_result', { success: false, msg: 'Dados inválidos' });
         return;
       }
 
-      const grupoUuid = crypto.randomUUID();
-      const senhaHash = isPrivate && password ? bcrypt.hashSync(password, 10) : null;
-      const nowIso = new Date().toISOString();
-
-      const insertGroup = db.prepare(`
-        INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_device_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      insertGroup.run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0, deviceId);
-
-      const sessionToken = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-
-      const insertSession = db.prepare(`
-        INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      insertSession.run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso);
-
-      socket.join(grupoId);
-      if (!connected_users[grupoId]) connected_users[grupoId] = {};
-      connected_users[grupoId][socket.id] = [usuario, sessionToken, deviceId];
-
-      socket.emit('group_result', {
-        success: true,
-        grupo_id: grupoId,
-        usuario,
-        session_token: sessionToken,
-        device_id: deviceId,
-        historico: [],
-        user_count: 1,
-        is_private: isPrivate,
-        is_admin: true,
-        message: '✅ Grupo criado com sucesso!'
-      });
-
-      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: 1 });
-    } catch (err: any) {
-      console.error('Error creating group:', err);
-      socket.emit('group_result', { success: false, msg: 'Erro interno ao criar grupo.' });
-    }
-  });
-
-  socket.on('join_group', (data) => {
-    const grupoId = sanitizeInput(data?.grupo_id || '', 10);
-    const usuario = sanitizeInput(data?.usuario || '', 15);
-    const password = (data?.password || '').trim();
-    const sessionToken = (data?.session_token || '').trim();
-    const deviceId = (data?.device_id || '').trim();
-
-    if (!deviceId || !grupoId || !usuario) {
-      socket.emit('group_result', { success: false, msg: 'Dados incompletos' });
-      return;
-    }
-
-    try {
-      const groupStmt = db.prepare(`SELECT grupo_uuid, privado, senha_hash FROM grupos WHERE grupo_id = ?`);
-      const groupInfo = groupStmt.get(grupoId) as { grupo_uuid: string; privado: number; senha_hash: string | null } | undefined;
-
-      if (!groupInfo) {
-        socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
+      if (!/^[a-zA-Z0-9_-]{1,10}$/.test(grupoId)) {
+        recordFailedAttempt(clientIp);
+        socket.emit('group_result', { success: false, msg: 'ID do grupo inválido' });
         return;
       }
 
-      const { grupo_uuid, privado, senha_hash } = groupInfo;
-
-      if (isUsernameTakenByOtherDevice(grupo_uuid, usuario, deviceId)) {
-        socket.emit('group_result', {
-          success: false,
-          msg: `O nome "${usuario}" já está em uso por outro dispositivo neste grupo.`
-        });
+      if (isPrivate && (!password || password.length < 4)) {
+        recordFailedAttempt(clientIp);
+        socket.emit('group_result', { success: false, msg: 'Senha necessária (mín. 4 caracteres).' });
         return;
       }
 
-      if (privado) {
-        if (!password) {
-          socket.emit('group_result', { success: false, msg: 'Este grupo é privado. Senha necessária.' });
+      try {
+        if (db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupoId)) {
+          recordFailedAttempt(clientIp);
+          socket.emit('group_result', { success: false, msg: 'Grupo já existe' });
           return;
         }
-        if (!senha_hash || !bcrypt.compareSync(password, senha_hash)) {
-          socket.emit('group_result', { success: false, msg: 'Senha incorreta' });
-          return;
-        }
-      }
+        const grupoUuid = crypto.randomUUID();
+        const senhaHash = isPrivate && password ? bcrypt.hashSync(password, 10) : null;
+        const nowIso = new Date().toISOString();
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        
+        db.prepare(`
+          INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_session_token)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0, sessionToken);
 
-      let validUsuario = null;
-      if (sessionToken) {
-        validUsuario = validateSession(sessionToken, grupoId, deviceId);
-      }
-
-      let activeToken = sessionToken;
-      const nowIso = new Date().toISOString();
-
-      if (!validUsuario || validUsuario !== usuario) {
-        const deleteOld = db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND usuario = ? AND device_id = ?`);
-        deleteOld.run(grupo_uuid, usuario, deviceId);
-
-        activeToken = crypto.randomBytes(32).toString('hex');
         const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-
-        const insertSession = db.prepare(`
+        db.prepare(`
           INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen)
           VALUES (?, ?, ?, ?, ?, ?)
-        `);
-        insertSession.run(activeToken, grupo_uuid, usuario, deviceId, expiresAt, nowIso);
-      } else {
-        const updateSession = db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`);
-        updateSession.run(nowIso, sessionToken);
+        `).run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso);
+
+        socket.join(grupoId);
+        if (!connected_users[grupoId]) connected_users[grupoId] = {};
+        connected_users[grupoId][socket.id] = [usuario, sessionToken, deviceId];
+
+        socket.emit('group_result', {
+          success: true,
+          grupo_id: grupoId,
+          usuario,
+          session_token: sessionToken,
+          device_id: deviceId,
+          historico: [],
+          user_count: 1,
+          is_private: isPrivate,
+          is_admin: true,
+          message: '✅ Grupo criado com sucesso!'
+        });
+        io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: 1 });
+      } catch (err) {
+        socket.emit('group_result', { success: false, msg: 'Erro interno ao criar grupo.' });
       }
+    });
 
-      // Fetch message history (last 100)
-      const histStmt = db.prepare(`
-        SELECT usuario, mensagem, data_hora 
-        FROM mensagens 
-        WHERE grupo_uuid = ? 
-        ORDER BY id ASC 
-        LIMIT 100
-      `);
-      const historico = histStmt.all(grupo_uuid).map((r: any) => ({
-        user: r.usuario,
-        msg: r.mensagem,
-        time: r.data_hora
-      }));
+    socket.on('join_group', (data) => {
+      const grupoId = sanitizeInput(data?.grupo_id || '', 10);
+      const usuario = sanitizeInput(data?.usuario || '', 15);
+      const password = (data?.password || '').trim();
+      const sessionToken = (data?.session_token || '').trim();
+      const deviceId = (data?.device_id || '').trim();
 
-      socket.join(grupoId);
-      if (!connected_users[grupoId]) connected_users[grupoId] = {};
-      
-      for (const [sId, [uName, _, dId]] of Object.entries(connected_users[grupoId])) {
-        if (uName === usuario && dId === deviceId) {
-          delete connected_users[grupoId][sId];
+      if (!deviceId || !grupoId || !usuario) return;
+
+      try {
+        const groupInfo = db.prepare(`SELECT grupo_uuid, privado, senha_hash, admin_session_token FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
+        if (!groupInfo) {
+          socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
+          return;
         }
+
+        const { grupo_uuid, privado, senha_hash, admin_session_token } = groupInfo;
+
+        if (privado && (!senha_hash || !bcrypt.compareSync(password, senha_hash))) {
+          socket.emit('group_result', { success: false, msg: 'Senha incorreta ou necessária' });
+          return;
+        }
+
+        let activeToken = sessionToken;
+        let validUsuario = sessionToken ? validateSession(sessionToken, grupoId, deviceId) : null;
+
+        if (!validUsuario || validUsuario !== usuario) {
+          db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND usuario = ? AND device_id = ?`).run(grupo_uuid, usuario, deviceId);
+          activeToken = crypto.randomBytes(32).toString('hex');
+          const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+          db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)`)
+            .run(activeToken, grupo_uuid, usuario, deviceId, expiresAt, new Date().toISOString());
+        }
+
+        const historico = db.prepare(`SELECT usuario, mensagem, data_hora FROM mensagens WHERE grupo_uuid = ? ORDER BY id DESC LIMIT 100`).all(grupo_uuid).reverse();
+
+        for (const [sId, [uName, _, dId]] of Object.entries(connected_users[grupoId] || {})) {
+          if (uName === usuario && dId === deviceId) {
+             const oldSocket = io.sockets.sockets.get(sId);
+             if (oldSocket) { oldSocket.leave(grupoId); oldSocket.disconnect(true); }
+             delete connected_users[grupoId][sId];
+          }
+        }
+        if (!connected_users[grupoId]) connected_users[grupoId] = {};
+        connected_users[grupoId][socket.id] = [usuario, activeToken, deviceId];
+        
+        socket.emit('group_result', {
+          success: true,
+          grupo_id: grupoId,
+          usuario,
+          session_token: activeToken,
+          device_id: deviceId,
+          historico: historico.map((r: any) => ({ user: r.usuario, msg: r.mensagem, time: r.data_hora })),
+          user_count: Object.keys(connected_users[grupoId]).length,
+          is_private: Boolean(privado),
+          is_admin: admin_session_token === activeToken,
+          message: '✅ Conectado ao grupo!'
+        });
+      } catch (err) {
+        socket.emit('group_result', { success: false, msg: 'Erro interno ao entrar no grupo.' });
       }
+    });
 
-      connected_users[grupoId][socket.id] = [usuario, activeToken, deviceId];
-      const currentCount = Object.keys(connected_users[grupoId]).length;
-
-      socket.emit('group_result', {
-        success: true,
-        grupo_id: grupoId,
-        usuario,
-        session_token: activeToken,
-        device_id: deviceId,
-        historico,
-        user_count: currentCount,
-        is_private: Boolean(privado),
-        message: '✅ Conectado ao grupo!'
-      });
-
-      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: currentCount });
-    } catch (err: any) {
-      console.error('Error joining group:', err);
-      socket.emit('group_result', { success: false, msg: 'Erro interno ao entrar no grupo.' });
-    }
-  });
-
-  socket.on('send_message', (data) => {
-    const grupoId = (data?.grupo_id || '').trim();
-    const usuario = (data?.usuario || '').trim();
-    const sessionToken = (data?.session_token || '').trim();
-    const deviceId = (data?.device_id || '').trim();
-    let msg = (data?.msg || '').trim();
-
-    if (!grupoId || !usuario || !sessionToken || !deviceId || !msg || msg.length > 500) {
-      return;
-    }
-
-    const validUser = validateSession(sessionToken, grupoId, deviceId);
-    if (!validUser || validUser !== usuario) {
-      return;
-    }
-
-    try {
-      const groupStmt = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`);
-      const group = groupStmt.get(grupoId) as { grupo_uuid: string } | undefined;
+    socket.on('send_message', (data) => {
+      const { grupo_id, usuario, session_token, device_id, msg } = data;
+      if (!validateSession(session_token, grupo_id, device_id)) return;
+      
+      const group = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupo_id) as any;
       if (!group) return;
 
-      msg = sanitizeInput(msg, 500);
-      const dataHora = new Date().toISOString();
+      const sanitized = sanitizeInput(msg, 500);
+      const time = new Date().toISOString();
+      db.prepare(`INSERT INTO mensagens (grupo_uuid, usuario, mensagem, data_hora) VALUES (?, ?, ?, ?)`).run(group.grupo_uuid, usuario, sanitized, time);
+      io.to(grupo_id).emit('receive_message', { grupo_id, usuario, msg: sanitized, timestamp: time });
+    });
 
-      const insertMsg = db.prepare(`
-        INSERT INTO mensagens (grupo_uuid, usuario, mensagem, data_hora)
-        VALUES (?, ?, ?, ?)
-      `);
-      insertMsg.run(group.grupo_uuid, usuario, msg, dataHora);
-
-      io.to(grupoId).emit('receive_message', {
-        grupo_id: grupoId,
-        usuario,
-        msg,
-        timestamp: dataHora
-      });
-    } catch (err) {
-      console.error('Error sending message:', err);
-    }
-  });
-
-  socket.on('leave_group', (data) => {
-    const grupoId = data?.grupo_id;
-    const sessionToken = data?.session_token;
-    const deviceId = data?.device_id;
-
-    if (grupoId && connected_users[grupoId] && connected_users[grupoId][socket.id]) {
-      socket.leave(grupoId);
-      delete connected_users[grupoId][socket.id];
-      if (Object.keys(connected_users[grupoId]).length === 0) {
-        delete connected_users[grupoId];
-      }
-      const count = Object.keys(connected_users[grupoId] || {}).length;
-      io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count });
-    }
-
-    if (sessionToken && deviceId) {
-      try {
-        const delStmt = db.prepare(`DELETE FROM sessoes WHERE session_token = ? AND device_id = ?`);
-        delStmt.run(sessionToken, deviceId);
-      } catch (err) {
-        console.error('Error removing session on leave:', err);
-      }
-    }
-
-    socket.emit('left_group', { success: true, grupo_id: grupoId, message: '✅ Você saiu do grupo' });
-  });
-
-  socket.on('heartbeat', (data) => {
-    const sessionToken = data?.session_token;
-    const deviceId = data?.device_id;
-    if (sessionToken && deviceId) {
-      try {
-        const stmt = db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ? AND device_id = ?`);
-        stmt.run(new Date().toISOString(), sessionToken, deviceId);
-      } catch (err) {
-        // silent
-      }
-    }
-  });
-
-  socket.on('request_recovery', (data) => {
-    const grupoId = sanitizeInput(data?.grupo_id || '', 10);
-    const usuario = sanitizeInput(data?.usuario || '', 15);
-    const deviceId = (data?.device_id || '').trim();
-
-    if (!grupoId || !usuario || !deviceId) {
-      socket.emit('recovery_result', { success: false, msg: 'Dados inválidos para recuperação' });
-      return;
-    }
-
-    try {
-      const stmt = db.prepare(`
-        SELECT g.grupo_uuid 
-        FROM grupos g
-        JOIN sessoes s ON g.grupo_uuid = s.grupo_uuid
-        WHERE g.grupo_id = ? AND s.usuario = ? AND s.device_id = ?
-      `);
-      if (!stmt.get(grupoId, usuario, deviceId)) {
-        socket.emit('recovery_result', { success: false, msg: 'Sessão anterior não encontrada para este dispositivo/usuário' });
+    socket.on('delete_group', (data) => {
+      const { grupo_id, session_token } = data;
+      const group = db.prepare(`SELECT grupo_uuid, admin_session_token FROM grupos WHERE grupo_id = ?`).get(grupo_id) as any;
+      if (!group || group.admin_session_token !== session_token) {
+        socket.emit('group_result', { success: false, msg: 'Não autorizado' });
         return;
       }
-
-      const token = Math.floor(100000 + Math.random() * 900000).toString();
-      const expires = new Date(Date.now() + 5 * 60 * 1000);
-
-      temp_tokens[token] = { grupo_id: grupoId, usuario, device_id: deviceId, expires };
-
-      socket.emit('recovery_result', {
-        success: true,
-        msg: `Token gerado com sucesso!`,
-        token
-      });
-    } catch (err: any) {
-      socket.emit('recovery_result', { success: false, msg: 'Erro na recuperação: ' + err.message });
-    }
+      db.prepare(`DELETE FROM grupos WHERE grupo_uuid = ?`).run(group.grupo_uuid);
+      db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ?`).run(group.grupo_uuid);
+      db.prepare(`DELETE FROM mensagens WHERE grupo_uuid = ?`).run(group.grupo_uuid);
+      io.to(grupo_id).emit('group_deleted', { msg: 'Grupo excluído.' });
+    });
   });
 
-  socket.on('verify_recovery', (data) => {
-    const token = (data?.token || '').trim();
-    const grupoId = sanitizeInput(data?.grupo_id || '', 10);
-    const usuario = sanitizeInput(data?.usuario || '', 15);
-    const deviceId = (data?.device_id || '').trim();
+  // Setup Vite development middleware or static serving
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.join(process.cwd(), 'dist')));
+    app.get('*', (_, res) => res.sendFile(path.join(process.cwd(), 'dist', 'index.html')));
+  }
 
-    const tokenInfo = temp_tokens[token];
-    if (!tokenInfo) {
-      socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
-      return;
-    }
-
-    if (tokenInfo.expires.getTime() < Date.now()) {
-      delete temp_tokens[token];
-      socket.emit('recovery_verified', { success: false, msg: 'Token expirado' });
-      return;
-    }
-
-    if (tokenInfo.grupo_id !== grupoId || tokenInfo.usuario !== usuario || tokenInfo.device_id !== deviceId) {
-      socket.emit('recovery_verified', { success: false, msg: 'Token não corresponde aos dados informados' });
-      return;
-    }
-
-    try {
-      const groupStmt = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`);
-      const group = groupStmt.get(grupoId) as { grupo_uuid: string } | undefined;
-      if (!group) {
-        socket.emit('recovery_verified', { success: false, msg: 'Grupo não encontrado' });
-        return;
-      }
-
-      const delStmt = db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND usuario = ? AND device_id = ?`);
-      delStmt.run(group.grupo_uuid, usuario, deviceId);
-
-      const sessionToken = crypto.randomBytes(32).toString('hex');
-      const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
-      const nowIso = new Date().toISOString();
-
-      const insertSession = db.prepare(`
-        INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      insertSession.run(sessionToken, group.grupo_uuid, usuario, deviceId, expiresAt, nowIso);
-
-      delete temp_tokens[token];
-
-      socket.emit('recovery_verified', {
-        success: true,
-        msg: 'Acesso recuperado com sucesso!',
-        session_token: sessionToken,
-        grupo_id: grupoId,
-        usuario,
-        device_id: deviceId
-      });
-    } catch (err: any) {
-      socket.emit('recovery_verified', { success: false, msg: 'Erro ao verificar token: ' + err.message });
-    }
-  });
-});
-
-// Setup Vite development middleware or static serving
-if (process.env.NODE_ENV !== 'production') {
-  const { createServer: createViteServer } = await import('vite');
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: 'spa'
-  });
-  app.use(vite.middlewares);
-} else {
-  app.use(express.static(path.join(process.cwd(), 'dist')));
-  app.get('*', (_, res) => {
-    res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
+  httpServer.listen(3001, '0.0.0.0', () => {
+    console.log(`🚀 Chat Grupal Server running at http://0.0.0.0:3001`);
   });
 }
 
-httpServer.listen(Number(PORT), '0.0.0.0', () => {
-  console.log(`🚀 Chat Grupal Server running at http://0.0.0.0:${PORT}`);
-});
+startServer().catch(console.error);
