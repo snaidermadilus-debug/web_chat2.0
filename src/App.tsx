@@ -19,6 +19,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<string>('');
   const [sessionToken, setSessionToken] = useState<string>('');
   const [isPrivate, setIsPrivate] = useState<boolean>(false);
+  const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [userCount, setUserCount] = useState<number>(0);
   const [messages, setMessages] = useState<Message[]>([]);
   
@@ -84,6 +85,7 @@ export default function App() {
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
       setIsPrivate(data.is_private || false);
+      setIsAdmin(data.is_admin || false);
       if (data.device_id) {
         setDeviceId(data.device_id);
       }

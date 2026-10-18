@@ -34,7 +34,10 @@ db.exec(`
     senha_hash TEXT,
     privado BOOLEAN DEFAULT 0
   );
+`);
+try { db.exec('ALTER TABLE grupos ADD COLUMN admin_device_id TEXT'); } catch(e) {}
 
+db.exec(`
   CREATE TABLE IF NOT EXISTS mensagens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     grupo_uuid TEXT NOT NULL,
@@ -192,10 +195,10 @@ io.on('connection', (socket) => {
       const nowIso = new Date().toISOString();
 
       const insertGroup = db.prepare(`
-        INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_device_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
-      insertGroup.run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0);
+      insertGroup.run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0, deviceId);
 
       const sessionToken = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
@@ -226,7 +229,7 @@ io.on('connection', (socket) => {
       io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: 1 });
     } catch (err: any) {
       console.error('Error creating group:', err);
-      socket.emit('group_result', { success: false, msg: 'Erro ao criar grupo: ' + err.message });
+      socket.emit('group_result', { success: false, msg: 'Erro interno ao criar grupo.' });
     }
   });
 
@@ -338,7 +341,7 @@ io.on('connection', (socket) => {
       io.to(grupoId).emit('user_count_update', { grupo_id: grupoId, count: currentCount });
     } catch (err: any) {
       console.error('Error joining group:', err);
-      socket.emit('group_result', { success: false, msg: 'Erro ao entrar no grupo: ' + err.message });
+      socket.emit('group_result', { success: false, msg: 'Erro interno ao entrar no grupo.' });
     }
   });
 
