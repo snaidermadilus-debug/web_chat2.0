@@ -36,7 +36,6 @@ export default function App() {
 
   const [recoverGrupo, setRecoverGrupo] = useState<string>('');
   const [recoverNome, setRecoverNome] = useState<string>('');
-  const [recoverPassword, setRecoverPassword] = useState<string>('');
   const [recoverToken, setRecoverToken] = useState<string>('');
   const [recoverAdminKey, setRecoverAdminKey] = useState<string>('');
   const [recoverSecretInput, setRecoverSecretInput] = useState<string>('');
@@ -334,16 +333,14 @@ export default function App() {
   };
 
   const handleRequestRecovery = () => {
-    if (!recoverGrupo.trim() || !recoverNome.trim()) {
-      showNotification('Preencha os campos obrigatórios', 'error');
+    if (!recoverGrupo.trim() || !recoverNome.trim() || !recoverSecretInput.trim()) {
+      showNotification('Preencha os campos obrigatórios, incluindo a Chave Pessoal', 'error');
       return;
     }
     socket?.emit('request_recovery', {
       grupo_id: recoverGrupo.trim(),
       usuario: recoverNome.trim(),
-      password: recoverPassword,
-      admin_key: recoverAdminKey.trim() || undefined,
-      recovery_secret: recoverSecretInput.trim() || undefined,
+      recovery_secret: recoverSecretInput.trim(),
       device_id: deviceId
     });
   };
@@ -706,17 +703,6 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha do Grupo <span className="text-white/40 font-normal">(se a sala for privada)</span></label>
-                <input
-                  type="password"
-                  value={recoverPassword}
-                  onChange={e => setRecoverPassword(e.target.value)}
-                  placeholder="Senha da sala (opcional se pública)"
-                  className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all"
-                />
-              </div>
-
-              <div>
                 <label className="block text-white/90 font-semibold mb-1 text-sm">Chave de Recuperação Pessoal <span className="text-pink-400">*</span></label>
                 <p className="text-[11px] text-white/50 mb-2">Informe a chave secreta fornecida a você ao entrar no grupo (prova de identidade).</p>
                 <input
@@ -740,7 +726,7 @@ export default function App() {
                 <div className="space-y-4 pt-4 border-t border-white/10 animate-in fade-in duration-300">
                   <div className="bg-purple-900/30 p-5 rounded-2xl border border-purple-500/30 text-center">
                     <div className="text-xs text-white/70 mb-2">Seu Token de Recuperação:</div>
-                    <div className="text-3xl font-mono font-bold tracking-widest text-pink-400 select-all">
+                    <div className="text-xl md:text-2xl font-mono font-bold tracking-wider text-pink-400 select-all break-all">
                       {generatedToken}
                     </div>
                     <div className="text-[11px] text-white/40 mt-1">Expira em 5 minutos</div>
@@ -752,9 +738,9 @@ export default function App() {
                       type="text"
                       value={recoverToken}
                       onChange={e => setRecoverToken(e.target.value)}
-                      placeholder="6 dígitos"
-                      maxLength={6}
-                      className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white font-mono text-center text-xl tracking-widest placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all"
+                      placeholder="Token recebido"
+                      maxLength={64}
+                      className="w-full p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white font-mono text-center text-sm md:text-base tracking-wider placeholder-white/30 focus:outline-none focus:border-pink-500 transition-all"
                     />
                   </div>
 

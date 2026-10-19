@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -10,14 +11,39 @@ import crypto from 'crypto';
 const app = express();
 const httpServer = createServer(app);
 const allowedOrigin = process.env.ALLOWED_ORIGIN;
+const allowedOriginsList = allowedOrigin ? allowedOrigin.split(',').map(s => s.trim()) : null;
+
 const io = new Server(httpServer, {
   cors: {
-    origin: allowedOrigin 
-      ? (allowedOrigin.includes(',') ? allowedOrigin.split(',').map(s => s.trim()) : allowedOrigin)
+    origin: allowedOriginsList
+      ? (origin, callback) => {
+          if (!origin) return callback(null, true);
+          if (allowedOriginsList.includes(origin)) {
+            return callback(null, true);
+          }
+          try {
+            const parsedUrl = new URL(origin);
+            if (allowedOriginsList.includes(parsedUrl.origin) || allowedOriginsList.includes(parsedUrl.hostname)) {
+              return callback(null, true);
+            }
+          } catch (e) {}
+          callback(null, false);
+        }
       : (origin, callback) => {
           if (!origin) return callback(null, true);
-          if (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('.run.app')) {
-            return callback(null, true);
+          try {
+            const parsedUrl = new URL(origin);
+            const hostname = parsedUrl.hostname;
+            if (
+              hostname === 'localhost' ||
+              hostname === '127.0.0.1' ||
+              hostname === 'run.app' ||
+              hostname.endsWith('.run.app')
+            ) {
+              return callback(null, true);
+            }
+          } catch (e) {
+            // invalid URL format
           }
           callback(null, false);
         },
@@ -113,7 +139,7 @@ console.log('✅ SQLite Database initialized at:', dbPath);
 
 // In-memory state
 const connected_users: Record<string, Record<string, [string, string, string]>> = {}; 
-const temp_tokens: Record<string, { grupo_id: string; usuario: string; device_id: string; expires: Date }> = {};
+const temp_tokens: Record<string, { grupo_id: string; usuario: string; device_id: string; socket_id: string; expires: Date }> = {};
 const failed_attempts: Record<string, [number, Date]> = {};
 const INACTIVITY_TIMEOUT = 24 * 60; // 24 hours
 
@@ -161,13 +187,11 @@ function validateSession(sessionToken: string, grupoId: string, auxiliaryDeviceI
   const row = stmt.get(sessionToken, grupoId, nowIso) as { usuario: string; device_id: string } | undefined;
 
   if (row) {
-    if (auxiliaryDeviceId && auxiliaryDeviceId !== row.device_id) {
-      db.prepare(`UPDATE sessoes SET last_seen = ?, device_id = ? WHERE session_token = ?`)
-        .run(nowIso, auxiliaryDeviceId, sessionToken);
-    } else {
-      db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`)
-        .run(nowIso, sessionToken);
+    if (auxiliaryDeviceId && row.device_id && auxiliaryDeviceId !== row.device_id) {
+      return null;
     }
+    db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`)
+      .run(nowIso, sessionToken);
     return row.usuario;
   }
   return null;
@@ -462,18 +486,16 @@ async function startServer() {
       }
       const grupoId = sanitizeInput(data?.grupo_id || '', 10);
       const usuario = sanitizeInput(data?.usuario || '', 15);
-      const password = (data?.password || '').trim();
-      const adminKey = (data?.admin_key || '').trim();
       const recoverySecret = (data?.recovery_secret || '').trim();
       const auxiliaryDeviceId = (data?.device_id || '').trim();
 
-      if (!grupoId || !usuario) {
+      if (!grupoId || !usuario || !recoverySecret) {
         recordFailedAttempt(clientIp);
-        socket.emit('recovery_result', { success: false, msg: 'Dados inválidos' });
+        socket.emit('recovery_result', { success: false, msg: 'Dados incompletos ou chave de recuperação obrigatória.' });
         return;
       }
 
-      const group = db.prepare(`SELECT grupo_uuid, privado, senha_hash, admin_key FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
+      const group = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
       if (!group) {
         recordFailedAttempt(clientIp);
         socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
@@ -486,35 +508,34 @@ async function startServer() {
         WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)
       `).get(group.grupo_uuid, usuario) as any;
 
-      if (!existingSession) {
+      if (!existingSession || !existingSession.recovery_secret_hash) {
         recordFailedAttempt(clientIp);
-        socket.emit('recovery_result', { success: false, msg: 'Usuário não encontrado neste grupo.' });
+        socket.emit('recovery_result', { success: false, msg: 'Usuário não encontrado ou sem chave de recuperação neste grupo.' });
         return;
       }
 
-      // Independent proof of identity: require correct personal recovery secret (or room password / admin key if private)
-      const isRecoverySecretValid = existingSession.recovery_secret_hash && recoverySecret && bcrypt.compareSync(recoverySecret, existingSession.recovery_secret_hash);
-      const isPasswordValid = group.privado && group.senha_hash && password && bcrypt.compareSync(password, group.senha_hash);
-      const isAdminKeyValid = group.admin_key && adminKey && adminKey === group.admin_key;
-
-      if (!isRecoverySecretValid && !isPasswordValid && !isAdminKeyValid) {
+      // Strictly require correct personal recovery secret (room password and admin key cannot impersonate personal accounts)
+      const isRecoverySecretValid = bcrypt.compareSync(recoverySecret, existingSession.recovery_secret_hash);
+      if (!isRecoverySecretValid) {
         recordFailedAttempt(clientIp);
-        socket.emit('recovery_result', { success: false, msg: 'Chave de recuperação pessoal (ou senha) incorreta.' });
+        socket.emit('recovery_result', { success: false, msg: 'Chave de recuperação pessoal incorreta.' });
         return;
       }
 
-      // Ensure the requesting device ID matches or is bound (preventing arbitrary hijacking)
-      if (existingSession.device_id && auxiliaryDeviceId && existingSession.device_id !== auxiliaryDeviceId && !isPasswordValid && !isAdminKeyValid) {
+      // Ensure the requesting device ID matches (preventing arbitrary hijacking)
+      if (existingSession.device_id && auxiliaryDeviceId && existingSession.device_id !== auxiliaryDeviceId) {
         recordFailedAttempt(clientIp);
         socket.emit('recovery_result', { success: false, msg: 'Não autorizado: dispositivo não confere com o proprietário da conta.' });
         return;
       }
 
-      const token = crypto.randomBytes(3).toString('hex');
+      // High entropy token (16 bytes = 32 hex chars)
+      const token = crypto.randomBytes(16).toString('hex');
       temp_tokens[token] = { 
         grupo_id: grupoId, 
         usuario, 
         device_id: auxiliaryDeviceId, 
+        socket_id: socket.id,
         expires: new Date(Date.now() + 5 * 60 * 1000) 
       };
       socket.emit('recovery_result', { success: true, token, msg: 'Token gerado' });
@@ -529,9 +550,22 @@ async function startServer() {
       const auxiliaryDeviceId = (data?.device_id || '').trim();
       const providedAdminKey = (data?.admin_key || '').trim();
       const tInfo = temp_tokens[token];
+
+      // Invalidate temporary token immediately upon attempt (single-use / fail-safe)
+      if (token && temp_tokens[token]) {
+        delete temp_tokens[token];
+      }
+
       if (!tInfo || tInfo.expires.getTime() < Date.now() || tInfo.grupo_id !== grupo_id || tInfo.usuario.toLowerCase() !== usuario.toLowerCase()) {
         recordFailedAttempt(clientIp);
         socket.emit('recovery_verified', { success: false, msg: 'Token inválido ou expirado' });
+        return;
+      }
+
+      // Bind to the exact connection socket that requested recovery
+      if (tInfo.socket_id && tInfo.socket_id !== socket.id) {
+        recordFailedAttempt(clientIp);
+        socket.emit('recovery_verified', { success: false, msg: 'Sessão de recuperação não autorizada (socket divergente).' });
         return;
       }
 
@@ -558,7 +592,6 @@ async function startServer() {
       db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
         .run(sessionToken, group.grupo_uuid, usuario, auxiliaryDeviceId, new Date(Date.now() + 24 * 3600 * 1000).toISOString(), new Date().toISOString(), newRecoverySecretHash);
 
-      // Independent admin credential verification: Never promote by display name or device ID!
       let isRecoveredAdmin = false;
       if (providedAdminKey && group.admin_key && providedAdminKey === group.admin_key) {
         db.prepare(`UPDATE grupos SET admin_session_token = ? WHERE grupo_uuid = ?`).run(sessionToken, group.grupo_uuid);
