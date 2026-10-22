@@ -145,19 +145,17 @@ function checkRateLimit(ip: string, operation: string): boolean {
 function validateSession(sessionToken: string, grupoId: string, auxiliaryDeviceId?: string): { usuario: string; device_id: string } | null {
   if (!sessionToken) return null;
   const stmt = db.prepare(`
-    SELECT s.usuario, s.device_id 
+    SELECT s.usuario, s.device_id, s.expires_at
     FROM sessoes s
     JOIN grupos g ON s.grupo_uuid = g.grupo_uuid
     WHERE s.session_token = ? AND g.grupo_id = ?
-      AND s.expires_at > ?
   `);
-  const nowIso = new Date().toISOString();
-  const row = stmt.get(sessionToken, grupoId, nowIso) as { usuario: string; device_id: string } | undefined;
+  const row = stmt.get(sessionToken, grupoId) as { usuario: string; device_id: string; expires_at: string } | undefined;
   
-  if (row) {
+  if (row && new Date(row.expires_at) > new Date()) {
     if (auxiliaryDeviceId && row.device_id && auxiliaryDeviceId !== row.device_id) return null;
-    db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`).run(nowIso, sessionToken);
-    return row;
+    db.prepare(`UPDATE sessoes SET last_seen = ? WHERE session_token = ?`).run(new Date().toISOString(), sessionToken);
+    return { usuario: row.usuario, device_id: row.device_id };
   }
   return null;
 }
@@ -193,21 +191,20 @@ async function startServer() {
         if (db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupoId)) return socket.emit('group_result', { success: false, msg: 'Grupo já existe' });
         const grupoUuid = crypto.randomUUID();
         const senhaHash = isPrivate && password ? bcrypt.hashSync(password, 10) : null;
-        const nowIso = new Date().toISOString();
-        const sessionToken = crypto.randomBytes(32).toString('hex');
         
         const adminKey = crypto.randomBytes(32).toString('hex');
         const adminKeyHash = bcrypt.hashSync(adminKey, 10);
         
-        db.prepare(`INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_session_token, admin_key_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(grupoUuid, grupoId, nowIso, usuario, senhaHash, isPrivate ? 1 : 0, sessionToken, adminKeyHash);
+        db.prepare(`INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_key_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+          .run(grupoUuid, grupoId, new Date().toISOString(), usuario, senhaHash, isPrivate ? 1 : 0, adminKeyHash);
 
+        const sessionToken = crypto.randomBytes(32).toString('hex');
         // 128 bit entropy (16 bytes)
         const recoverySecret = crypto.randomBytes(16).toString('hex');
         const recoverySecretHash = bcrypt.hashSync(recoverySecret, 10);
         const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
         db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-          .run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, nowIso, recoverySecretHash);
+          .run(sessionToken, grupoUuid, usuario, deviceId, expiresAt, new Date().toISOString(), recoverySecretHash);
 
         socket.join(grupoId);
         if (!connected_users[grupoId]) connected_users[grupoId] = {};
@@ -223,12 +220,18 @@ async function startServer() {
       if (!checkRateLimit(clientIp, 'join')) return socket.emit('group_result', { success: false, msg: 'Tente mais tarde.' });
       const { grupo_id: grupoId, usuario: nome, password, session_token, device_id: auxDeviceId } = data;
       
-      const groupInfo = db.prepare(`SELECT grupo_uuid, privado, senha_hash, admin_session_token FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
+      const groupInfo = db.prepare(`SELECT grupo_uuid, privado, senha_hash FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
       if (!groupInfo) return socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
       
       let validSession = session_token ? validateSession(session_token, grupoId, auxDeviceId) : null;
       let activeToken = session_token;
       
+      // Check if user already has an active session from another device
+      const existingUserSession = db.prepare('SELECT device_id FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').get(groupInfo.grupo_uuid, nome) as any;
+      if (existingUserSession && existingUserSession.device_id !== auxDeviceId) {
+          return socket.emit('group_result', { success: false, msg: 'Usuário já conectado em outro dispositivo.' });
+      }
+
       if (!validSession || validSession.usuario.toLowerCase() !== nome.toLowerCase()) {
         if (groupInfo.privado && (!password || !bcrypt.compareSync(password, groupInfo.senha_hash))) return socket.emit('group_result', { success: false, msg: 'Senha incorreta' });
         
@@ -239,7 +242,8 @@ async function startServer() {
         
         socket.emit('group_result', { success: true, grupo_id: grupoId, usuario: nome, session_token: activeToken, recovery_secret: recoverySecret, is_private: groupInfo.privado, is_admin: false, message: '✅ Conectado!' });
       } else {
-        socket.emit('group_result', { success: true, grupo_id: grupoId, usuario: nome, session_token: activeToken, is_private: groupInfo.privado, is_admin: groupInfo.admin_session_token === activeToken, message: '✅ Conectado!' });
+        const group = db.prepare('SELECT admin_session_token FROM grupos WHERE grupo_uuid = ?').get(groupInfo.grupo_uuid) as any;
+        socket.emit('group_result', { success: true, grupo_id: grupoId, usuario: nome, session_token: activeToken, is_private: groupInfo.privado, is_admin: group.admin_session_token === activeToken, message: '✅ Conectado!' });
       }
       
       socket.join(grupoId);
@@ -257,6 +261,39 @@ async function startServer() {
         
         db.prepare('UPDATE grupos SET admin_session_token = ? WHERE grupo_uuid = ?').run(session_token, group.grupo_uuid);
         socket.emit('admin_result', { success: true, msg: 'Privilégios recuperados' });
+    });
+
+    socket.on('request_recovery', (data) => {
+      if (!checkRateLimit(clientIp, 'recovery')) return socket.emit('recovery_result', { success: false, msg: 'Tente mais tarde.' });
+      
+      const { grupo_id: grupoId, usuario: nome, recovery_secret, device_id: auxDeviceId } = data;
+      const group = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
+      if (!group) return socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
+      
+      const existingSession = db.prepare(`SELECT recovery_secret_hash FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).get(group.grupo_uuid, nome) as any;
+      if (!existingSession || !bcrypt.compareSync(recovery_secret, existingSession.recovery_secret_hash)) return socket.emit('recovery_result', { success: false, msg: 'Dados inválidos' });
+      
+      const token = crypto.randomBytes(16).toString('hex');
+      temp_tokens[token] = { grupo_id: grupoId, usuario: nome, device_id: auxDeviceId, socket_id: socket.id, expires: new Date(Date.now() + 5 * 60 * 1000) };
+      socket.emit('recovery_result', { success: true, token, msg: 'Token gerado' });
+    });
+
+    socket.on('verify_recovery', (data) => {
+      if (!checkRateLimit(clientIp, 'recovery')) return socket.emit('recovery_verified', { success: false, msg: 'Tente mais tarde.' });
+      const { token, grupo_id, usuario } = data;
+      const tInfo = temp_tokens[token];
+      if (!tInfo || tInfo.expires < new Date() || tInfo.grupo_id !== grupo_id || tInfo.usuario.toLowerCase() !== usuario.toLowerCase()) return socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
+      
+      delete temp_tokens[token];
+      const group = db.prepare('SELECT grupo_uuid FROM grupos WHERE grupo_id = ?').get(grupo_id) as any;
+      
+      db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(group.grupo_uuid, usuario);
+      const sessionToken = crypto.randomBytes(32).toString('hex');
+      const recoverySecret = crypto.randomBytes(16).toString('hex');
+      db.prepare(`INSERT INTO sessoes (session_token, grupo_uuid, usuario, device_id, expires_at, last_seen, recovery_secret_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(sessionToken, group.grupo_uuid, usuario, tInfo.device_id, new Date(Date.now() + 24 * 3600 * 1000).toISOString(), new Date().toISOString(), bcrypt.hashSync(recoverySecret, 10));
+        
+      socket.emit('recovery_verified', { success: true, session_token: sessionToken, recovery_secret: recoverySecret, msg: 'Acesso recuperado!' });
     });
 
     socket.on('send_message', (data) => {
