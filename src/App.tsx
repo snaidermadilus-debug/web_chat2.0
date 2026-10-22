@@ -116,7 +116,7 @@ export default function App() {
         setRecoverySecret(data.recovery_secret);
       }
 
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId, data.admin_key, data.recovery_secret);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId);
       setScreen('chat');
 
       if (data.historico && data.historico.length > 0) {
@@ -165,7 +165,7 @@ export default function App() {
         setRecoverySecret(data.recovery_secret);
       }
       setIsAdmin(data.is_admin || false);
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id, data.admin_key, data.recovery_secret);
+      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id);
       
       socket?.emit('join_group', {
         grupo_id: data.grupo_id,
@@ -232,30 +232,13 @@ export default function App() {
     }
   };
 
-  const saveSession = (grupo: string, usuario: string, token: string, devId: string, admKey?: string, recSecret?: string) => {
+  const saveSession = (grupo: string, usuario: string, token: string, devId: string) => {
     localStorage.setItem('chat_session_group', grupo);
-    let currentAdminKey = admKey;
-    let currentRecoverySecret = recSecret;
-    if (currentAdminKey === undefined || currentRecoverySecret === undefined) {
-      try {
-        const prev = localStorage.getItem('chat_session');
-        if (prev) {
-          const parsed = JSON.parse(prev);
-          if (currentAdminKey === undefined) currentAdminKey = parsed.admin_key;
-          if (currentRecoverySecret === undefined) currentRecoverySecret = parsed.recovery_secret;
-        }
-      } catch (e) {}
-    }
-    if (currentRecoverySecret) {
-      setRecoverySecret(currentRecoverySecret);
-    }
     localStorage.setItem('chat_session', JSON.stringify({
       grupo_id: grupo,
       usuario,
       session_token: token,
       device_id: devId,
-      admin_key: currentAdminKey || '',
-      recovery_secret: currentRecoverySecret || '',
       timestamp: Date.now()
     }));
   };
@@ -270,12 +253,6 @@ export default function App() {
           setCurrentGroup(data.grupo_id);
           setCurrentUser(data.usuario);
           setSessionToken(data.session_token);
-          if (data.admin_key) {
-            setAdminKey(data.admin_key);
-          }
-          if (data.recovery_secret) {
-            setRecoverySecret(data.recovery_secret);
-          }
           const devId = data.device_id || deviceId;
           if (data.device_id) setDeviceId(data.device_id);
 
@@ -286,8 +263,7 @@ export default function App() {
                 grupo_id: data.grupo_id,
                 usuario: data.usuario,
                 session_token: data.session_token,
-                device_id: devId,
-                admin_key: data.admin_key || undefined
+                device_id: devId
               });
             }
           };
