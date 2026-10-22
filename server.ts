@@ -455,6 +455,9 @@ async function startServer() {
 
     socket.on('leave_group', (data) => {
       const { grupo_id, session_token, device_id } = data;
+      const validUsuario = validateSession(session_token, grupo_id, device_id);
+      if (!validUsuario) return;
+      
       if (grupo_id) {
         socket.leave(grupo_id);
         if (connected_users[grupo_id] && connected_users[grupo_id][socket.id]) {

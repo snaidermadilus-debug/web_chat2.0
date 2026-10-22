@@ -45,6 +45,22 @@ export default function App() {
 
   const [messageInput, setMessageInput] = useState<string>('');
   const [notification, setNotification] = useState<{ msg: string; type: 'success' | 'error' | 'info' } | null>(null);
+  
+  // Modal state
+  const [modalConfig, setModalConfig] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    confirmLabel: string;
+    isLoading?: boolean;
+  } | null>(null);
+
+  const [keysModalConfig, setKeysModalConfig] = useState<{
+    isOpen: boolean;
+    personalKey: string | null;
+    adminKey: string | null;
+  } | null>(null);
 
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const heartbeatIntervalRef = useRef<any>(null);
@@ -372,24 +388,36 @@ export default function App() {
   };
 
   const handleLeaveGroup = () => {
-    if (confirm('Deseja realmente sair do grupo?')) {
-      socket?.emit('leave_group', {
-        grupo_id: currentGroup,
-        session_token: sessionToken,
-        device_id: deviceId
-      });
-    }
+    setModalConfig({
+      isOpen: true,
+      title: 'Sair do grupo?',
+      message: 'Você deseja realmente sair do grupo?',
+      confirmLabel: 'Sair do grupo',
+      onConfirm: () => {
+        socket?.emit('leave_group', {
+          grupo_id: currentGroup,
+          session_token: sessionToken,
+          device_id: deviceId
+        });
+      }
+    });
   };
 
   const handleDeleteGroup = () => {
-    if (confirm('Deseja realmente EXCLUIR o grupo? Esta ação é irreversível.')) {
-      socket?.emit('delete_group', {
-        grupo_id: currentGroup,
-        session_token: sessionToken,
-        device_id: deviceId,
-        admin_key: adminKey || undefined
-      });
-    }
+    setModalConfig({
+      isOpen: true,
+      title: 'Excluir grupo?',
+      message: `Você deseja realmente EXCLUIR o grupo "${currentGroup}"? Esta ação é irreversível.`,
+      confirmLabel: 'Excluir grupo',
+      onConfirm: () => {
+        socket?.emit('delete_group', {
+          grupo_id: currentGroup,
+          session_token: sessionToken,
+          device_id: deviceId,
+          admin_key: adminKey || undefined
+        });
+      }
+    });
   };
 
   const formatTime = (isoString: string) => {
@@ -819,19 +847,13 @@ export default function App() {
                   <span>Chave Admin</span>
                 </button>
               )}
-              {recoverySecret && (
-                <button
-                  onClick={() => {
-                    navigator.clipboard?.writeText(recoverySecret);
-                    showNotification('Chave de Recuperação Pessoal copiada!', 'success');
-                  }}
-                  title="Copiar chave de recuperação pessoal"
-                  className="hidden sm:flex items-center gap-1.5 bg-pink-500/10 hover:bg-pink-500/20 border border-pink-500/30 text-pink-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
-                >
-                  <Key className="w-3.5 h-3.5 text-pink-300" />
-                  <span>Chave Pessoal</span>
-                </button>
-              )}
+              <button
+                onClick={() => setKeysModalConfig({ isOpen: true, personalKey: recoverySecret, adminKey: isAdmin ? adminKey : null })}
+                className="hidden sm:flex items-center gap-1.5 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-purple-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
+              >
+                <Key className="w-3.5 h-3.5 text-purple-300" />
+                <span>Chaves</span>
+              </button>
               {isAdmin && (
                 <button
                   onClick={handleDeleteGroup}
@@ -902,6 +924,75 @@ export default function App() {
                 <Send className="w-5 h-5 ml-0.5" />
               </button>
             </div>
+          </div>
+        </div>
+      )}
+      {/* Modal Confirm */}
+      {modalConfig && modalConfig.isOpen && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-[#1c1c1e] text-white rounded-3xl p-8 max-w-sm w-full border border-white/10 shadow-2xl">
+            <h2 className="text-xl font-bold mb-3">{modalConfig.title}</h2>
+            <p className="text-white/70 mb-8">{modalConfig.message}</p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setModalConfig({ ...modalConfig, isOpen: false })}
+                className="flex-1 py-3 px-4 rounded-xl bg-white/5 hover:bg-white/10 text-white font-medium transition"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={async () => {
+                  setModalConfig({ ...modalConfig, isLoading: true });
+                  await modalConfig.onConfirm();
+                  setModalConfig(null);
+                }}
+                disabled={modalConfig.isLoading}
+                className="flex-1 py-3 px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold transition disabled:opacity-50"
+              >
+                {modalConfig.isLoading ? '...' : modalConfig.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Keys Modal */}
+      {keysModalConfig && keysModalConfig.isOpen && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-[#1c1c1e] text-white rounded-3xl p-8 max-w-sm w-full border border-white/10 shadow-2xl">
+            <h2 className="text-xl font-bold mb-6">Suas Chaves</h2>
+            <div className="space-y-6">
+              {keysModalConfig.personalKey && (
+                <div>
+                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Pessoal de Recuperação</label>
+                  <div className="flex items-center gap-2 p-3 bg-pink-900/20 border border-pink-500/20 rounded-xl">
+                    <span className="font-mono text-pink-300 break-all flex-1">{keysModalConfig.personalKey}</span>
+                    <button onClick={() => navigator.clipboard.writeText(keysModalConfig.personalKey!)} className="text-pink-300 hover:text-white">
+                      <Copy className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-white/50 mt-1">Guarde fora do celular. Se perder, não há como recuperar sua identidade.</p>
+                </div>
+              )}
+              {keysModalConfig.adminKey && (
+                <div>
+                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Administrativa do Grupo</label>
+                  <div className="flex items-center gap-2 p-3 bg-amber-900/20 border border-amber-500/20 rounded-xl">
+                    <span className="font-mono text-amber-300 break-all flex-1">{keysModalConfig.adminKey}</span>
+                    <button onClick={() => navigator.clipboard.writeText(keysModalConfig.adminKey!)} className="text-amber-300 hover:text-white">
+                      <Copy className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-white/50 mt-1">Permite exclusão do grupo.</p>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={() => setKeysModalConfig(null)}
+              className="w-full mt-8 py-3 px-4 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-bold transition"
+            >
+              Entendido
+            </button>
           </div>
         </div>
       )}
