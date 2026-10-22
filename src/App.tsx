@@ -324,6 +324,15 @@ export default function App() {
     });
   };
 
+  const handleReclaimAdmin = (adminKey: string) => {
+    socket?.emit('reclaim_admin', {
+      grupo_id: currentGroup,
+      session_token: sessionToken,
+      device_id: deviceId,
+      admin_key: adminKey
+    });
+  };
+
   const handleRequestRecovery = () => {
     if (!recoverGrupo.trim() || !recoverNome.trim() || !recoverSecretInput.trim()) {
       showNotification('Preencha os campos obrigatórios, incluindo a Chave Pessoal', 'error');
@@ -959,7 +968,18 @@ export default function App() {
                       <Copy className="w-5 h-5" />
                     </button>
                   </div>
-                  <p className="text-[10px] text-white/50 mt-1">Permite exclusão do grupo.</p>
+                  <p className="text-[10px] text-white/50 mt-1">Permite recuperar privilégios administrativos.</p>
+                </div>
+              )}
+              {!isAdmin && (
+                <div>
+                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Recuperar Admin</label>
+                  <input type="text" id="adminKeyInput" placeholder="Cole sua chave admin aqui" className="w-full p-3 bg-[#28282d] border border-white/10 rounded-xl text-white font-mono text-xs placeholder-white/30" />
+                  <button onClick={() => {
+                      const key = (document.getElementById('adminKeyInput') as HTMLInputElement).value;
+                      handleReclaimAdmin(key);
+                      setKeysModalConfig(null);
+                  }} className="w-full mt-2 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold transition">Recuperar</button>
                 </div>
               )}
             </div>
