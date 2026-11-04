@@ -110,6 +110,10 @@ try {
     db.exec('ALTER TABLE grupos ADD COLUMN admin_key_hash TEXT');
     console.log('✅ Migrated grupos: added admin_key_hash column');
   }
+  if (!tableInfo.find(col => col.name === 'admin_session_token')) {
+    db.exec('ALTER TABLE grupos ADD COLUMN admin_session_token TEXT');
+    console.log('✅ Migrated grupos: added admin_session_token column');
+  }
 } catch (e: any) {
   console.error('❌ Database migration error:', e?.message || e);
 }
@@ -221,11 +225,11 @@ async function startServer() {
         
         const adminKey = crypto.randomBytes(32).toString('hex');
         const adminKeyHash = bcrypt.hashSync(adminKey, 10);
-        
-        db.prepare(`INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_key_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-          .run(grupoUuid, grupoId, new Date().toISOString(), usuario, senhaHash, isPrivate ? 1 : 0, adminKeyHash);
-
         const sessionToken = crypto.randomBytes(32).toString('hex');
+        
+        db.prepare(`INSERT INTO grupos (grupo_uuid, grupo_id, criado_em, criado_por, senha_hash, privado, admin_session_token, admin_key_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(grupoUuid, grupoId, new Date().toISOString(), usuario, senhaHash, isPrivate ? 1 : 0, sessionToken, adminKeyHash);
+
         // 128 bit entropy (16 bytes)
         const recoverySecret = crypto.randomBytes(16).toString('hex');
         const recoverySecretHash = bcrypt.hashSync(recoverySecret, 10);

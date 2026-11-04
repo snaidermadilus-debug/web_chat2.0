@@ -23,8 +23,14 @@ async function runTests() {
   const joinGroupPromise = waitForEvent<any>(socket, "group_result");
   socket.emit("join_group", { grupo_id: testGrp1, usuario: "nonadmin", device_id: "d2", admin_key: "somekey" });
   const joinRes: any = await joinGroupPromise;
-  assert.strictEqual(joinRes.is_admin, false, "Test 1 Failed: Admin key in join_group granted admin");
+  assert.strictEqual(joinRes.success, true, "Test 1 Failed: regular join did not succeed");
+  assert.notStrictEqual(joinRes.is_admin, true, "Test 1 Failed: Admin key in join_group granted admin");
   console.log("Test 1 Passed: Admin key in join_group did not grant admin.");
+
+  const unauthorizedDeletePromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("delete_group", { grupo_id: testGrp1, session_token: joinRes.session_token, device_id: "d2" });
+  const unauthorizedDelete = await unauthorizedDeletePromise;
+  assert.strictEqual(unauthorizedDelete.success, false, "Test 1 Failed: regular member deleted the group");
 
   // Test 2: leave_group cleanup
   const leaveGroupPromise = waitForEvent<any>(socket, "left_group");
@@ -163,10 +169,10 @@ async function runTests() {
   assert.strictEqual(res8Create.success, true, "Test 8 Failed: could not create group for orphan cleanup regression");
 
   const db = await import("node:sqlite").then(({ DatabaseSync }) => new DatabaseSync("chat_database.db"));
-  const groupRow = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(testGrp8) as { grupo_uuid: string } | undefined;
+  const groupRow = db.prepare(`SELECT grupo_uuid, admin_session_token FROM grupos WHERE grupo_id = ?`).get(testGrp8) as { grupo_uuid: string; admin_session_token: string } | undefined;
   assert.ok(groupRow, "Test 8 Failed: group row not found before cleanup check");
+  assert.strictEqual(groupRow.admin_session_token, res8Create.session_token, "Test 8 Failed: creator admin session was not persisted");
   db.prepare(`INSERT INTO mensagens (grupo_uuid, usuario, mensagem, data_hora) VALUES (?, ?, ?, ?)`).run(groupRow.grupo_uuid, "ghostuser", "orphan message", new Date().toISOString());
-  db.prepare(`UPDATE grupos SET admin_session_token = ? WHERE grupo_uuid = ?`).run(res8Create.session_token, groupRow.grupo_uuid);
 
   const groupDeletedPromise = waitForEvent<any>(socket, "group_deleted");
   socket.emit("delete_group", { grupo_id: testGrp8, session_token: res8Create.session_token, device_id: "d50" });
