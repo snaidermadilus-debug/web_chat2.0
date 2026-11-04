@@ -330,6 +330,10 @@ async function startServer() {
         recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
       }
+      if (tInfo.socket_id && tInfo.socket_id !== socket.id) {
+        recordFailedAttempt(clientIp, 'recovery');
+        return socket.emit('recovery_verified', { success: false, msg: 'Token não associado à solicitação original' });
+      }
       if (!device_id || !tInfo.device_id || String(device_id) !== String(tInfo.device_id)) {
         recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_verified', { success: false, msg: 'Dispositivo inválido para este token' });
@@ -339,6 +343,8 @@ async function startServer() {
         recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_verified', { success: false, msg: 'Grupo não encontrado' });
       }
+
+      delete temp_tokens[token];
       
       db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(group.grupo_uuid, usuario);
       const sessionToken = crypto.randomBytes(32).toString('hex');

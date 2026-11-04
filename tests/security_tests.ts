@@ -117,6 +117,44 @@ async function runTests() {
   assert.ok(blocked, "Test 6 Failed: repeated invalid join attempts did not trigger rate limiting");
   console.log("Test 6 Passed: repeated invalid join attempts hit the rate limit.");
 
+  // Test 7: recovery token must be one-time use only
+  const testGrp7 = makeGroupId("testgrp7");
+  const createGrp7Promise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: testGrp7, usuario: "singleusetoken", device_id: "d30" });
+  const res7Create: any = await createGrp7Promise;
+  assert.strictEqual(res7Create.success, true, "Test 7 Failed: could not create group for single-use token test");
+
+  const reqRecovery7Promise = waitForEvent<any>(socket, "recovery_result");
+  socket.emit("request_recovery", {
+    grupo_id: testGrp7,
+    usuario: "singleusetoken",
+    recovery_secret: res7Create.recovery_secret,
+    device_id: "d30"
+  });
+  const res7Request: any = await reqRecovery7Promise;
+  assert.strictEqual(res7Request.success, true, "Test 7 Failed: recovery request was denied");
+
+  const verifyFirstPromise = waitForEvent<any>(socket, "recovery_verified");
+  socket.emit("verify_recovery", {
+    token: res7Request.token,
+    grupo_id: testGrp7,
+    usuario: "singleusetoken",
+    device_id: "d30"
+  });
+  const res7FirstVerify: any = await verifyFirstPromise;
+  assert.strictEqual(res7FirstVerify.success, true, "Test 7 Failed: valid recovery was rejected on first use");
+
+  const verifySecondPromise = waitForEvent<any>(socket, "recovery_verified");
+  socket.emit("verify_recovery", {
+    token: res7Request.token,
+    grupo_id: testGrp7,
+    usuario: "singleusetoken",
+    device_id: "d30"
+  });
+  const res7SecondVerify: any = await verifySecondPromise;
+  assert.strictEqual(res7SecondVerify.success, false, "Test 7 Failed: token was reused after first verification");
+  console.log("Test 7 Passed: recovery token is single-use only.");
+
   console.log("All tests passed successfully.");
   process.exit(0);
 }
