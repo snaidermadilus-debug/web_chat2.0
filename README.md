@@ -1,69 +1,93 @@
-# 💬 Chat Grupal X9A - Secure Real-Time Chat
+# Chat Grupal X9A
 
-O **Chat Grupal X9A** é uma aplicação web moderna de chat em tempo real com segurança avançada, desenvolvida com **React**, **Node.js (Express)**, **Socket.io** e **SQLite**.
+Aplicação de chat em grupo em tempo real, com autenticação por sessão, proteção por device ID, salas privadas e recuperação de acesso.
 
-A aplicação permite criar e participar de salas de conversa públicas ou privadas, oferecendo proteção de identidade por dispositivo, criptografia de senhas, sessões seguras com tokens e um sistema de recuperação de acesso.
+## Visão geral
 
----
+O projeto usa:
+- React + TypeScript + Vite no frontend
+- Express + Socket.IO no backend
+- SQLite para persistência local
+- bcryptjs para hashing de senhas e chaves
 
-## 🌟 Funcionalidades Principais
+## Funcionalidades
 
-- **Comunicação em Tempo Real**: Mensagens enviadas e recebidas instantaneamente via WebSockets / Socket.io.
-- **Salas Públicas e Privadas**: Crie grupos abertos ou protegidos com senha criptografada (`bcrypt`).
-- **Proteção de Identidade por Dispositivo (`Device ID`)**: Impede que outros usuários utilizem o mesmo nome de usuário em outro dispositivo na mesma sala.
-- **Sessões Seguras com Tokens**: Gerenciamento automático de tokens de sessão com persistência e verificação de inatividade.
-- **Recuperação de Acesso**: Sistema de verificação por token temporário de 6 dígitos (válido por 5 minutos) caso o usuário precise retomar seu acesso.
-- **Interface Moderna (Glassmorphism & Dark Mode)**: Design altamente responsivo com animações suaves, indicadores de usuários online (`● X online`), marcação de mensagens próprias (`(você)`) e alertas dinâmicos.
+- criação de grupos públicos ou privados
+- autenticação por token de sessão
+- proteção por device ID para evitar identidade cruzada entre dispositivos
+- recuperação de acesso com token temporário
+- administração de grupo com chave de admin
+- mensagens em tempo real via WebSockets
+- limpeza de sessão ao sair do grupo
 
----
+## Requisitos
 
-## 🛠️ Arquitetura e Tecnologias
+- Node.js 20+
+- npm
 
-- **Frontend**: React 19, TypeScript, Tailwind CSS, Lucide React, Socket.io Client.
-- **Backend**: Node.js, Express, Socket.io Server, Node SQLite (`node:sqlite`), `bcryptjs`.
+## Instalação
 
----
+No diretório do projeto:
 
-## 📦 Como Executar o Projeto
+```bash
+npm install --legacy-peer-deps
+```
 
-### Pré-requisitos
-- Node.js (versão 20 ou superior recomendada)
-- Gerenciador de pacotes (`npm` ou `bun`)
+Se o projeto usa origem específica para CORS, crie o arquivo de ambiente:
 
-### Instalação e Execução
+```bash
+cp .env.example .env
+```
 
-1. Instale as dependências:
-   ```bash
-   npm install
+Exemplo de configuração:
 
-   pkg update
-   pkg install nodejs-lts git -y
+```env
+ALLOWED_ORIGIN=http://localhost:3000
+```
 
-   npm install --legacy-peer-deps
+Se quiser permitir mais de uma origem, separe por vírgula:
 
-   npm install -D tsx --legacy-peer-deps
-   ```
+```env
+ALLOWED_ORIGIN=http://localhost:3000,http://127.0.0.1:3000
+```
 
-2. Inicie o servidor de desenvolvimento (que executa o backend Express/Socket.io e o frontend Vite simultaneamente):
-   ```bash
-   npm run dev
+## Execução em desenvolvimento
 
-   npm run dev -- --host 0.0.0.0
-   ```
+```bash
+npm run dev
+```
 
-3. Acesse a aplicação no seu navegador:
-   ```text
-   http://coloca o seu IP.:3000
+A aplicação fica disponível em:
 
-   por exemplo.
-   ...text
-   http://192.168.?.?.:3000
-   ```
+```text
+http://localhost:3000
+```
 
----
+## Produção
 
-## 🔒 Segurança e Boas Práticas
+Build:
 
-- **Sanitização de Entradas**: Todos os inputs são limpos e sanitizados no servidor para prevenir ataques de injeção e XSS.
-- **Rate Limiting**: Proteção contra tentativas excessivas de criação de grupos e solicitações de recuperação.
-- **Heartbeat & Inatividade**: O sistema monitora batimentos cardíacos dos clientes para atualizar o status online e gerenciar sessões inativas.
+```bash
+npm run build
+```
+
+Iniciar servidor em produção:
+
+```bash
+npm run start
+```
+
+## Segurança implementada
+
+- validação de sessão por token e device
+- bloqueio de uso de chave admin em join_group
+- prevenção de identidade duplicada em outro dispositivo
+- recuperação de acesso vinculada ao mesmo device
+- hash de senhas e tokens de recuperação com bcrypt
+- rate limiting básico para criação e recuperação
+
+## Observações
+
+- para ambientes locais, normalmente a origem permitida é `http://localhost:3000`
+- o banco SQLite é criado automaticamente no diretório do projeto
+- se houver problemas de compatibilidade de dependências, use `npm install --legacy-peer-deps`
