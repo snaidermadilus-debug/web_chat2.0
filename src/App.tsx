@@ -155,9 +155,11 @@ export default function App() {
         showNotification(data.msg, 'error');
         return;
       }
+      const recoveredDeviceId = data.device_id || deviceId;
       setCurrentGroup(data.grupo_id);
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
+      setDeviceId(recoveredDeviceId);
       if (data.admin_key) {
         setAdminKey(data.admin_key);
       }
@@ -165,13 +167,13 @@ export default function App() {
         setRecoverySecret(data.recovery_secret);
       }
       setIsAdmin(data.is_admin || false);
-      saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id);
+      saveSession(data.grupo_id, data.usuario, data.session_token, recoveredDeviceId);
       
       socket?.emit('join_group', {
         grupo_id: data.grupo_id,
         usuario: data.usuario,
         session_token: data.session_token,
-        device_id: data.device_id,
+        device_id: recoveredDeviceId,
         admin_key: data.admin_key
       });
     });

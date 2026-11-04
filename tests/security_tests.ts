@@ -71,6 +71,35 @@ async function runTests() {
   assert.strictEqual(res4Verify.success, false, "Test 4 Failed: recovery token was accepted from a different device");
   console.log("Test 4 Passed: Recovery token is bound to its device.");
 
+  // Test 5: Successful recovery returns the full session metadata used by the client.
+  const testGrp5 = makeGroupId("testgrp5");
+  const createGroup5Promise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: testGrp5, usuario: "recoveruser2", device_id: "d15" });
+  const res5Create: any = await createGroup5Promise;
+
+  const reqRecovery5Promise = waitForEvent<any>(socket, "recovery_result");
+  socket.emit("request_recovery", {
+    grupo_id: testGrp5,
+    usuario: "recoveruser2",
+    recovery_secret: res5Create.recovery_secret,
+    device_id: "d15"
+  });
+  const res5Request: any = await reqRecovery5Promise;
+
+  const verifyRecovery5Promise = waitForEvent<any>(socket, "recovery_verified");
+  socket.emit("verify_recovery", {
+    token: res5Request.token,
+    grupo_id: testGrp5,
+    usuario: "recoveruser2",
+    device_id: "d15"
+  });
+  const res5Verify: any = await verifyRecovery5Promise;
+  assert.strictEqual(res5Verify.success, true, "Test 5 Failed: valid recovery was rejected");
+  assert.strictEqual(res5Verify.grupo_id, testGrp5, "Test 5 Failed: group id missing after recovery");
+  assert.strictEqual(res5Verify.usuario, "recoveruser2", "Test 5 Failed: user missing after recovery");
+  assert.strictEqual(res5Verify.device_id, "d15", "Test 5 Failed: device id missing after recovery");
+  console.log("Test 5 Passed: successful recovery returns the session metadata needed by the client.");
+
   console.log("All tests passed successfully.");
   process.exit(0);
 }
