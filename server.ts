@@ -59,6 +59,18 @@ const PORT = process.env.PORT || 3000;
 const dbPath = path.join(process.cwd(), 'chat_database.db');
 const db = new DatabaseSync(dbPath);
 
+db.exec('PRAGMA foreign_keys = ON;');
+
+function cleanupOrphanedData() {
+  db.exec(`
+    DELETE FROM mensagens
+    WHERE grupo_uuid NOT IN (SELECT grupo_uuid FROM grupos);
+
+    DELETE FROM sessoes
+    WHERE grupo_uuid NOT IN (SELECT grupo_uuid FROM grupos);
+  `);
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS grupos (
     grupo_uuid TEXT PRIMARY KEY,
@@ -101,6 +113,8 @@ try {
 } catch (e: any) {
   console.error('❌ Database migration error:', e?.message || e);
 }
+
+cleanupOrphanedData();
 
 const connected_users: Record<string, Record<string, [string, string, string]>> = {}; 
 const temp_tokens: Record<string, { grupo_id: string; usuario: string; device_id: string; socket_id: string; expires: Date }> = {};
@@ -245,10 +259,15 @@ async function startServer() {
       
       let validSession = session_token ? validateSession(session_token, grupoId, auxDeviceId) : null;
       let activeToken = session_token;
+
+      db.prepare(`DELETE FROM sessoes WHERE expires_at <= ?`).run(new Date().toISOString());
       
-      // Check if user already has an active session from another device
-      const existingUserSession = db.prepare('SELECT device_id FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').get(groupInfo.grupo_uuid, nome) as any;
-      if (existingUserSession && existingUserSession.device_id !== auxDeviceId) {
+      const existingUserSession = db.prepare('SELECT device_id, expires_at FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').get(groupInfo.grupo_uuid, nome) as any;
+      if (existingUserSession && new Date(existingUserSession.expires_at) <= new Date()) {
+        db.prepare('DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').run(groupInfo.grupo_uuid, nome);
+      }
+      const activeUserSession = db.prepare('SELECT device_id FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').get(groupInfo.grupo_uuid, nome) as any;
+      if (activeUserSession && activeUserSession.device_id !== auxDeviceId) {
           recordFailedAttempt(clientIp, 'join');
           return socket.emit('group_result', { success: false, msg: 'Usuário já conectado em outro dispositivo.' });
       }

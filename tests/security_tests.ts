@@ -155,6 +155,27 @@ async function runTests() {
   assert.strictEqual(res7SecondVerify.success, false, "Test 7 Failed: token was reused after first verification");
   console.log("Test 7 Passed: recovery token is single-use only.");
 
+  // Test 8: deleting a group must also remove orphaned history rows
+  const testGrp8 = makeGroupId("testgrp8");
+  const createGroup8Promise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: testGrp8, usuario: "cleanupuser", device_id: "d50" });
+  const res8Create: any = await createGroup8Promise;
+  assert.strictEqual(res8Create.success, true, "Test 8 Failed: could not create group for orphan cleanup regression");
+
+  const db = await import("node:sqlite").then(({ DatabaseSync }) => new DatabaseSync("chat_database.db"));
+  const groupRow = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(testGrp8) as { grupo_uuid: string } | undefined;
+  assert.ok(groupRow, "Test 8 Failed: group row not found before cleanup check");
+  db.prepare(`INSERT INTO mensagens (grupo_uuid, usuario, mensagem, data_hora) VALUES (?, ?, ?, ?)`).run(groupRow.grupo_uuid, "ghostuser", "orphan message", new Date().toISOString());
+  db.prepare(`UPDATE grupos SET admin_session_token = ? WHERE grupo_uuid = ?`).run(res8Create.session_token, groupRow.grupo_uuid);
+
+  const groupDeletedPromise = waitForEvent<any>(socket, "group_deleted");
+  socket.emit("delete_group", { grupo_id: testGrp8, session_token: res8Create.session_token, device_id: "d50" });
+  await groupDeletedPromise;
+
+  const remainingRows = db.prepare(`SELECT COUNT(*) as count FROM mensagens WHERE grupo_uuid = ?`).get(groupRow.grupo_uuid) as { count: number };
+  assert.strictEqual(remainingRows.count, 0, "Test 8 Failed: orphaned messages remained after group deletion");
+  console.log("Test 8 Passed: deleting a group removes orphaned history rows.");
+
   console.log("All tests passed successfully.");
   process.exit(0);
 }
