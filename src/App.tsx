@@ -5,9 +5,41 @@ import { MessageSquare, Shield, Users, Key, LogOut, ArrowRight, ArrowLeft, Send,
 let socket: Socket | null = null;
 
 interface Message {
+  id: number;
   user: string;
   msg: string;
   time: string;
+}
+
+interface PendingMessage {
+  clientMsgId: string;
+  text: string;
+  grupoId: string;
+  usuario: string;
+  sessionToken: string;
+  deviceId: string;
+  attempts: number;
+  status: 'queued' | 'sending' | 'failed';
+}
+
+type MessageDeliveryState = 'idle' | 'queued' | 'sending' | 'failed';
+type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'rejoining' | 'failed';
+
+interface ActiveSession {
+  grupo_id: string;
+  usuario: string;
+  session_token: string;
+  device_id: string;
+}
+
+const MAX_MESSAGE_ATTEMPTS = 3;
+const MESSAGE_ACK_TIMEOUT_MS = 5000;
+const MAX_MESSAGES_IN_STATE = 1000;
+
+function mergeMessageWindow(current: Message[], incoming: Message[]) {
+  const byId = new Map(current.map(message => [message.id, message]));
+  incoming.forEach(message => byId.set(message.id, message));
+  return [...byId.values()].sort((left, right) => left.id - right.id).slice(-MAX_MESSAGES_IN_STATE);
 }
 
 export default function App() {
@@ -23,6 +55,10 @@ export default function App() {
   const [adminKey, setAdminKey] = useState<string>('');
   const [userCount, setUserCount] = useState<number>(0);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [historyHasMore, setHistoryHasMore] = useState<boolean>(false);
+  const [historyLoading, setHistoryLoading] = useState<boolean>(false);
+  const [messageDeliveryState, setMessageDeliveryState] = useState<MessageDeliveryState>('idle');
+  const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   
   // Form inputs
   const [createGrupo, setCreateGrupo] = useState<string>('');
@@ -65,6 +101,18 @@ export default function App() {
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const heartbeatIntervalRef = useRef<any>(null);
   const currentGroupRef = useRef<string>('');
+  const activeSessionRef = useRef<ActiveSession | null>(null);
+  const hasConnectedRef = useRef<boolean>(false);
+  const rejoinPendingRef = useRef<boolean>(false);
+  const messagesRef = useRef<Message[]>([]);
+  const recoveryAdminKeyRef = useRef<string>('');
+  const pendingMessageRef = useRef<PendingMessage | null>(null);
+  const messageRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const notificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historyBeforeIdRef = useRef<number | null>(null);
+  const historyRequestPendingRef = useRef<boolean>(false);
+  const historyRequestGroupRef = useRef<string>('');
+  const historyPrependScrollHeightRef = useRef<number | null>(null);
 
   useEffect(() => {
     currentGroupRef.current = currentGroup;
@@ -89,18 +137,52 @@ export default function App() {
 
     socket.on('connect', () => {
       showNotification('Conectado ao servidor', 'success');
+      setConnectionState('connected');
+      const activeSession = activeSessionRef.current;
+      if (hasConnectedRef.current && activeSession) {
+        setConnectionState('rejoining');
+        rejoinPendingRef.current = true;
+        socket?.emit('join_group', activeSession);
+      }
+      hasConnectedRef.current = true;
+      const pendingMessage = pendingMessageRef.current;
+      if (pendingMessage && pendingMessage.status !== 'failed') sendPendingMessage(pendingMessage);
     });
 
     socket.on('disconnect', () => {
+      setConnectionState('reconnecting');
       stopHeartbeat();
+      clearMessageRetryTimer();
+      const pendingMessage = pendingMessageRef.current;
+      if (pendingMessage) {
+        pendingMessage.status = 'queued';
+        setMessageDeliveryState('queued');
+      }
+    });
+    socket.io.on('reconnect_attempt', () => setConnectionState('reconnecting'));
+    socket.io.on('reconnect_failed', () => {
+      setConnectionState('failed');
+      showNotification('Não foi possível reconectar ao servidor.', 'error');
     });
 
     socket.on('group_result', (data: any) => {
       if (!data.success) {
+        if (rejoinPendingRef.current) {
+          rejoinPendingRef.current = false;
+          setConnectionState('failed');
+        }
         showNotification(data.msg, 'error');
         return;
       }
 
+      rejoinPendingRef.current = false;
+      setConnectionState('connected');
+      activeSessionRef.current = {
+        grupo_id: data.grupo_id,
+        usuario: data.usuario,
+        session_token: data.session_token,
+        device_id: data.device_id || dId
+      };
       setCurrentGroup(data.grupo_id);
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
@@ -119,25 +201,81 @@ export default function App() {
       saveSession(data.grupo_id, data.usuario, data.session_token, data.device_id || dId);
       setScreen('chat');
 
-      if (data.historico && data.historico.length > 0) {
-        setMessages(data.historico);
-      } else {
-        setMessages([]);
-      }
+      setMessages([]);
+      messagesRef.current = [];
+      historyBeforeIdRef.current = null;
+      historyRequestGroupRef.current = data.grupo_id;
+      historyRequestPendingRef.current = true;
+      setHistoryHasMore(false);
+      setHistoryLoading(true);
+      socket?.emit('load_history', {
+        grupo_id: data.grupo_id,
+        session_token: data.session_token,
+        device_id: data.device_id || dId,
+        limit: 30
+      });
 
       showNotification(data.message || 'Conectado!', 'success');
-      startHeartbeat(data.session_token, data.device_id || dId);
+      startHeartbeat(data.grupo_id, data.session_token, data.device_id || dId);
     });
 
     socket.on('receive_message', (data: any) => {
       const activeGroup = currentGroupRef.current || localStorage.getItem('chat_session_group');
       if (data.grupo_id === activeGroup) {
-        setMessages(prev => [...prev, { user: data.usuario, msg: data.msg, time: data.timestamp }]);
+        const nextMessages = mergeMessageWindow(messagesRef.current, [{ id: Number(data.id), user: data.usuario, msg: data.msg, time: data.timestamp }]);
+        messagesRef.current = nextMessages;
+        setMessages(nextMessages);
+        if (nextMessages.length >= MAX_MESSAGES_IN_STATE) setHistoryHasMore(false);
       }
     });
 
+    socket.on('history_result', (data: any) => {
+      if (data.grupo_id !== historyRequestGroupRef.current) return;
+      historyRequestPendingRef.current = false;
+      setHistoryLoading(false);
+      if (!data.success) {
+        setHistoryHasMore(false);
+        showNotification(data.msg || 'Não foi possível carregar o histórico.', 'error');
+        return;
+      }
+
+      const incomingMessages: Message[] = data.messages || [];
+      if (data.before_id !== null && chatMessagesRef.current) {
+        historyPrependScrollHeightRef.current = chatMessagesRef.current.scrollHeight;
+      }
+      const nextMessages = mergeMessageWindow(messagesRef.current, incomingMessages);
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
+      historyBeforeIdRef.current = data.next_before_id;
+      setHistoryHasMore(Boolean(data.has_more) && nextMessages.length < MAX_MESSAGES_IN_STATE);
+    });
+
+    socket.on('message_result', (data: any) => {
+      const pendingMessage = pendingMessageRef.current;
+      if (!pendingMessage || data.client_msg_id !== pendingMessage.clientMsgId) return;
+
+      clearMessageRetryTimer();
+      if (!data.success) {
+        pendingMessage.status = 'failed';
+        setMessageDeliveryState('failed');
+        showNotification(data.msg || 'Não foi possível enviar a mensagem.', 'error');
+        return;
+      }
+
+      pendingMessageRef.current = null;
+      setMessageDeliveryState('idle');
+      if (data.message && currentGroupRef.current === pendingMessage.grupoId) {
+        const nextMessages = mergeMessageWindow(messagesRef.current, [data.message as Message]);
+        messagesRef.current = nextMessages;
+        setMessages(nextMessages);
+      }
+      setMessageInput(current => current === pendingMessage.text && currentGroupRef.current === pendingMessage.grupoId ? '' : current);
+      showNotification('Mensagem entregue.', 'success');
+    });
+
     socket.on('user_count_update', (data: any) => {
-      setUserCount(data.count);
+      const activeGroup = currentGroupRef.current || localStorage.getItem('chat_session_group');
+      if (data.grupo_id === activeGroup) setUserCount(data.count);
     });
 
     socket.on('recovery_result', (data: any) => {
@@ -160,9 +298,7 @@ export default function App() {
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
       setDeviceId(recoveredDeviceId);
-      if (data.admin_key) {
-        setAdminKey(data.admin_key);
-      }
+      setAdminKey(data.is_admin ? recoveryAdminKeyRef.current : '');
       if (data.recovery_secret) {
         setRecoverySecret(data.recovery_secret);
       }
@@ -173,8 +309,7 @@ export default function App() {
         grupo_id: data.grupo_id,
         usuario: data.usuario,
         session_token: data.session_token,
-        device_id: recoveredDeviceId,
-        admin_key: data.admin_key
+        device_id: recoveredDeviceId
       });
     });
 
@@ -198,28 +333,112 @@ export default function App() {
     return () => {
       socket?.disconnect();
       stopHeartbeat();
+      clearMessageRetryTimer();
+      if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
+      socket?.io.off('reconnect_attempt');
+      socket?.io.off('reconnect_failed');
     };
   }, []);
 
   // Auto scroll chat
   useEffect(() => {
+    messagesRef.current = messages;
     if (chatMessagesRef.current) {
-      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
+      const previousHeight = historyPrependScrollHeightRef.current;
+      if (previousHeight !== null) {
+        chatMessagesRef.current.scrollTop += chatMessagesRef.current.scrollHeight - previousHeight;
+        historyPrependScrollHeightRef.current = null;
+      } else {
+        chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
+      }
     }
   }, [messages]);
 
   const showNotification = (msg: string, type: 'success' | 'error' | 'info' = 'info') => {
+    if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
     setNotification({ msg, type });
-    setTimeout(() => {
+    notificationTimerRef.current = setTimeout(() => {
       setNotification(null);
+      notificationTimerRef.current = null;
     }, 5000);
   };
 
-  const startHeartbeat = (token: string, devId: string) => {
+  const copyToClipboard = async (value: string, label: string) => {
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        copied = true;
+      } catch {}
+    }
+    if (!copied) {
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      try {
+        document.body.appendChild(textarea);
+        textarea.select();
+        copied = document.execCommand('copy');
+      } catch {
+        copied = false;
+      } finally {
+        textarea.remove();
+      }
+    }
+    showNotification(copied ? `${label} copiada.` : `Não foi possível copiar ${label.toLowerCase()}.`, copied ? 'success' : 'error');
+  };
+
+  const clearMessageRetryTimer = () => {
+    if (messageRetryTimerRef.current) {
+      clearTimeout(messageRetryTimerRef.current);
+      messageRetryTimerRef.current = null;
+    }
+  };
+
+  const sendPendingMessage = (pendingMessage = pendingMessageRef.current) => {
+    if (!pendingMessage || pendingMessageRef.current?.clientMsgId !== pendingMessage.clientMsgId || pendingMessage.status === 'failed') return;
+    const activeSocket = socket;
+    if (!activeSocket?.connected) {
+      pendingMessage.status = 'queued';
+      setMessageDeliveryState('queued');
+      return;
+    }
+
+    clearMessageRetryTimer();
+    pendingMessage.attempts += 1;
+    pendingMessage.status = 'sending';
+    setMessageDeliveryState('sending');
+    activeSocket.volatile.emit('send_message', {
+      grupo_id: pendingMessage.grupoId,
+      usuario: pendingMessage.usuario,
+      session_token: pendingMessage.sessionToken,
+      device_id: pendingMessage.deviceId,
+      client_msg_id: pendingMessage.clientMsgId,
+      msg: pendingMessage.text
+    });
+
+    messageRetryTimerRef.current = setTimeout(() => {
+      const currentPending = pendingMessageRef.current;
+      if (!currentPending || currentPending.clientMsgId !== pendingMessage.clientMsgId) return;
+      if (!socket?.connected) {
+        currentPending.status = 'queued';
+        setMessageDeliveryState('queued');
+      } else if (currentPending.attempts < MAX_MESSAGE_ATTEMPTS) {
+        sendPendingMessage(currentPending);
+      } else {
+        currentPending.status = 'failed';
+        setMessageDeliveryState('failed');
+      }
+    }, MESSAGE_ACK_TIMEOUT_MS);
+  };
+
+  const startHeartbeat = (grupoId: string, token: string, devId: string) => {
     stopHeartbeat();
     heartbeatIntervalRef.current = setInterval(() => {
       if (socket && socket.connected) {
         socket.emit('heartbeat', {
+          grupo_id: grupoId,
           session_token: token,
           device_id: devId
         });
@@ -292,6 +511,15 @@ export default function App() {
     setIsAdmin(false);
     setUserCount(0);
     setMessages([]);
+    messagesRef.current = [];
+    activeSessionRef.current = null;
+    rejoinPendingRef.current = false;
+    historyBeforeIdRef.current = null;
+    historyRequestPendingRef.current = false;
+    historyRequestGroupRef.current = '';
+    historyPrependScrollHeightRef.current = null;
+    setHistoryHasMore(false);
+    setHistoryLoading(false);
     localStorage.removeItem('chat_session');
     localStorage.removeItem('chat_session_group');
     stopHeartbeat();
@@ -301,6 +529,10 @@ export default function App() {
   const handleCreateGroup = () => {
     if (!createGrupo.trim() || !createNome.trim()) {
       showNotification('Preencha os campos obrigatórios', 'error');
+      return;
+    }
+    if (createPrivate && !createPassword.trim()) {
+      showNotification('Defina uma senha para criar um grupo privado.', 'error');
       return;
     }
     socket?.emit('create_group', {
@@ -353,6 +585,7 @@ export default function App() {
       showNotification('Preencha todos os campos obrigatórios', 'error');
       return;
     }
+    recoveryAdminKeyRef.current = recoverAdminKey.trim();
     socket?.emit('verify_recovery', {
       token: recoverToken.trim(),
       grupo_id: recoverGrupo.trim(),
@@ -362,16 +595,45 @@ export default function App() {
     });
   };
 
-  const handleSendMessage = () => {
-    if (!messageInput.trim()) return;
-    socket?.emit('send_message', {
+  const handleLoadMoreHistory = () => {
+    const beforeId = historyBeforeIdRef.current;
+    if (!historyHasMore || beforeId === null || historyRequestPendingRef.current || !socket?.connected) return;
+    historyRequestPendingRef.current = true;
+    setHistoryLoading(true);
+    socket.emit('load_history', {
       grupo_id: currentGroup,
-      usuario: currentUser,
       session_token: sessionToken,
       device_id: deviceId,
-      msg: messageInput.trim()
+      before_id: beforeId,
+      limit: 30
     });
-    setMessageInput('');
+  };
+
+  const handleSendMessage = () => {
+    const message = messageInput.trim();
+    if (!message || pendingMessageRef.current !== null) return;
+    const pendingMessage: PendingMessage = {
+      clientMsgId: crypto.randomUUID(),
+      text: message,
+      grupoId: currentGroup,
+      usuario: currentUser,
+      sessionToken,
+      deviceId,
+      attempts: 0,
+      status: 'queued'
+    };
+    pendingMessageRef.current = pendingMessage;
+    setMessageDeliveryState('queued');
+    sendPendingMessage(pendingMessage);
+  };
+
+  const handleRetryPendingMessage = () => {
+    const pendingMessage = pendingMessageRef.current;
+    if (!pendingMessage) return;
+    pendingMessage.attempts = 0;
+    pendingMessage.status = 'queued';
+    setMessageDeliveryState('queued');
+    sendPendingMessage(pendingMessage);
   };
 
   const handleLeaveGroup = () => {
@@ -569,7 +831,7 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha (opcional)</label>
+                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha {createPrivate ? '(obrigatória)' : '(opcional)'}</label>
                 <input
                   type="password"
                   value={createPassword}
@@ -804,8 +1066,12 @@ export default function App() {
                   <span className="bg-gradient-to-r from-purple-400 to-cyan-400 bg-clip-text text-transparent">💬 {currentGroup}</span>
                 </div>
                 <div className="text-xs text-white/60 flex items-center gap-2 mt-1">
-                  <span className="w-2.5 h-2.5 bg-emerald-400 rounded-full animate-ping inline-block" />
-                  <span>{userCount} online</span>
+                  <span className={`w-2.5 h-2.5 rounded-full inline-block ${connectionState === 'connected' ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+                  <span>
+                    {connectionState === 'connected' ? `${userCount} online` :
+                      connectionState === 'rejoining' ? 'Restabelecendo sala...' :
+                        connectionState === 'failed' ? 'Sem conexão' : 'Reconectando...'}
+                  </span>
                 </div>
               </div>
             </div>
@@ -823,10 +1089,7 @@ export default function App() {
               )}
               {isAdmin && adminKey && (
                 <button
-                  onClick={() => {
-                    navigator.clipboard?.writeText(adminKey);
-                    showNotification('Chave de Administrador copiada!', 'success');
-                  }}
+                  onClick={() => void copyToClipboard(adminKey, 'Chave de Administrador')}
                   title="Copiar chave de recuperação do administrador"
                   className="hidden md:flex items-center gap-1.5 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
                 >
@@ -862,16 +1125,27 @@ export default function App() {
 
           {/* Messages Feed */}
           <div ref={chatMessagesRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-gradient-to-b from-[#0a0a0a] to-[#121212]">
+            {historyHasMore && (
+              <div className="flex justify-center">
+                <button
+                  onClick={handleLoadMoreHistory}
+                  disabled={historyLoading}
+                  className="px-4 py-2 text-sm text-cyan-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl disabled:opacity-50"
+                >
+                  {historyLoading ? 'Carregando...' : 'Carregar mensagens anteriores'}
+                </button>
+              </div>
+            )}
             {messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-white/40 space-y-2">
                 <MessageSquare className="w-12 h-12 stroke-[1.5] animate-pulse" />
-                <p>Nenhuma mensagem ainda. Seja o primeiro a falar!</p>
+                <p>{historyLoading ? 'Carregando histórico...' : 'Nenhuma mensagem ainda. Seja o primeiro a falar!'}</p>
               </div>
             ) : (
-              messages.map((m, idx) => {
+              messages.map(m => {
                 const isMe = m.user === currentUser;
                 return (
-                  <div key={idx} className={`max-w-[85%] md:max-w-[65%] p-4 rounded-2xl relative shadow-lg backdrop-blur-md border border-white/5 ${
+                  <div key={m.id} className={`max-w-[85%] md:max-w-[65%] p-4 rounded-2xl relative shadow-lg backdrop-blur-md border border-white/5 ${
                     isMe ? 'ml-auto bg-gradient-to-br from-purple-600 to-cyan-500 text-white rounded-br-sm' : 'mr-auto bg-[#222228] text-white/95 rounded-bl-sm'
                   }`}>
                     <div className="font-semibold text-xs opacity-80 mb-1 flex items-center gap-1.5">
@@ -893,19 +1167,37 @@ export default function App() {
 
           {/* Message Input Area */}
           <div className="p-4 md:p-6 bg-[#1a1a1ae6] border-t border-white/10 backdrop-blur-xl">
+            {messageDeliveryState !== 'idle' && (
+              <div className="max-w-4xl mx-auto mb-3 flex items-center justify-between gap-3 text-xs text-white/60" role="status" aria-live="polite">
+                <span>
+                  {messageDeliveryState === 'queued' ? 'Aguardando conexão para enviar...' :
+                    messageDeliveryState === 'sending' ? 'Enviando e aguardando confirmação...' :
+                      'Falha no envio. Mensagem mantida na caixa.'}
+                </span>
+                {messageDeliveryState === 'failed' && (
+                  <button
+                    onClick={handleRetryPendingMessage}
+                    className="flex items-center gap-1.5 text-cyan-200 hover:text-white"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Tentar novamente</span>
+                  </button>
+                )}
+              </div>
+            )}
             <div className="max-w-4xl mx-auto flex items-center gap-3">
               <input
                 type="text"
                 value={messageInput}
                 onChange={e => setMessageInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') handleSendMessage(); }}
+                onKeyDown={e => { if (e.key === 'Enter' && messageDeliveryState === 'idle') handleSendMessage(); }}
                 placeholder="Digite sua mensagem..."
                 maxLength={500}
                 className="flex-1 p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white placeholder-white/30 focus:outline-none focus:border-purple-500 focus:ring-4 focus:ring-purple-500/20 transition-all text-sm md:text-base"
               />
               <button
                 onClick={handleSendMessage}
-                disabled={!messageInput.trim()}
+                disabled={!messageInput.trim() || messageDeliveryState !== 'idle'}
                 className="w-14 h-14 rounded-2xl bg-gradient-to-r from-purple-600 to-cyan-500 text-white flex items-center justify-center shadow-lg hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100 transition-all shrink-0 cursor-pointer"
               >
                 <Send className="w-5 h-5 ml-0.5" />
@@ -954,7 +1246,7 @@ export default function App() {
                   <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Pessoal de Recuperação</label>
                   <div className="flex items-center gap-2 p-3 bg-pink-900/20 border border-pink-500/20 rounded-xl">
                     <span className="font-mono text-pink-300 break-all flex-1">{keysModalConfig.personalKey}</span>
-                    <button onClick={() => navigator.clipboard.writeText(keysModalConfig.personalKey!)} className="text-pink-300 hover:text-white">
+                    <button onClick={() => void copyToClipboard(keysModalConfig.personalKey!, 'Chave pessoal')} className="text-pink-300 hover:text-white">
                       <Copy className="w-5 h-5" />
                     </button>
                   </div>
@@ -966,7 +1258,7 @@ export default function App() {
                   <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Administrativa do Grupo</label>
                   <div className="flex items-center gap-2 p-3 bg-amber-900/20 border border-amber-500/20 rounded-xl">
                     <span className="font-mono text-amber-300 break-all flex-1">{keysModalConfig.adminKey}</span>
-                    <button onClick={() => navigator.clipboard.writeText(keysModalConfig.adminKey!)} className="text-amber-300 hover:text-white">
+                    <button onClick={() => void copyToClipboard(keysModalConfig.adminKey!, 'Chave de administrador')} className="text-amber-300 hover:text-white">
                       <Copy className="w-5 h-5" />
                     </button>
                   </div>

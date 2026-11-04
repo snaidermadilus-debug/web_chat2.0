@@ -43,6 +43,7 @@ Exemplo de configuração:
 
 ```env
 ALLOWED_ORIGIN=http://localhost:3000
+REDIS_URL=
 ```
 
 Se quiser permitir mais de uma origem, separe por vírgula:
@@ -50,6 +51,8 @@ Se quiser permitir mais de uma origem, separe por vírgula:
 ```env
 ALLOWED_ORIGIN=http://localhost:3000,http://127.0.0.1:3000
 ```
+
+Para compartilhar salas Socket.IO e contagens de usuários online entre múltiplas instâncias, configure `REDIS_URL` com a mesma URL Redis em cada instância. Sem essa variável, a presença fica limitada ao processo local. O banco SQLite também é local por padrão; Redis não compartilha grupos, sessões nem mensagens entre bancos separados.
 
 ## Execução em desenvolvimento
 
