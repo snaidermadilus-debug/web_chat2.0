@@ -100,6 +100,23 @@ async function runTests() {
   assert.strictEqual(res5Verify.device_id, "d15", "Test 5 Failed: device id missing after recovery");
   console.log("Test 5 Passed: successful recovery returns the session metadata needed by the client.");
 
+  // Test 6: repeated invalid joins must trigger rate limiting
+  const testGrp6 = makeGroupId("testgrp6");
+  const createGrp6Promise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: testGrp6, usuario: "ratelimituser", device_id: "d20", private: true, password: "correctpass" });
+  const res6Create: any = await createGrp6Promise;
+  assert.strictEqual(res6Create.success, true, "Test 6 Failed: could not create private group for rate-limit test");
+
+  const responses: any[] = [];
+  socket.on("group_result", (data) => responses.push(data));
+  for (let i = 0; i < 11; i++) {
+    socket.emit("join_group", { grupo_id: testGrp6, usuario: "ratelimituser", device_id: `d${i + 200}`, password: "wrongpass" });
+  }
+  await new Promise(r => setTimeout(r, 200));
+  const blocked = responses.find((item) => item.msg === "Tente mais tarde.");
+  assert.ok(blocked, "Test 6 Failed: repeated invalid join attempts did not trigger rate limiting");
+  console.log("Test 6 Passed: repeated invalid join attempts hit the rate limit.");
+
   console.log("All tests passed successfully.");
   process.exit(0);
 }

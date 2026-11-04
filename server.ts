@@ -132,6 +132,7 @@ function recordFailedAttempt(ip: string, operation: string) {
 function checkRateLimit(ip: string, operation: string): boolean {
   const now = new Date();
   const key = `${ip}:${operation}`;
+  pruneFailedAttempts();
   if (!failed_attempts[key]) return true;
   const [count, lastAttempt] = failed_attempts[key];
   if (now.getTime() > lastAttempt.getTime() + 15 * 60 * 1000) {
@@ -140,6 +141,16 @@ function checkRateLimit(ip: string, operation: string): boolean {
   }
   let limit = operation === 'recovery' ? 3 : operation === 'admin' ? 5 : 10;
   return count < limit;
+}
+
+function pruneFailedAttempts() {
+  const now = Date.now();
+  for (const key of Object.keys(failed_attempts)) {
+    const [, lastAttempt] = failed_attempts[key];
+    if (now - lastAttempt.getTime() > 60 * 60 * 1000) {
+      delete failed_attempts[key];
+    }
+  }
 }
 
 function validateSession(sessionToken: string, grupoId: string, auxiliaryDeviceId?: string): { usuario: string; device_id: string } | null {
@@ -161,6 +172,8 @@ function validateSession(sessionToken: string, grupoId: string, auxiliaryDeviceI
 }
 
 async function startServer() {
+  setInterval(() => pruneFailedAttempts(), 60 * 1000);
+
   io.on('connection', (socket) => {
     const clientIp = socket.handshake.address || '127.0.0.1';
     
@@ -225,7 +238,10 @@ async function startServer() {
       const session_token = data?.session_token || null;
       
       const groupInfo = db.prepare(`SELECT grupo_uuid, privado, senha_hash FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
-      if (!groupInfo) return socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
+      if (!groupInfo) {
+        recordFailedAttempt(clientIp, 'join');
+        return socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
+      }
       
       let validSession = session_token ? validateSession(session_token, grupoId, auxDeviceId) : null;
       let activeToken = session_token;
@@ -233,6 +249,7 @@ async function startServer() {
       // Check if user already has an active session from another device
       const existingUserSession = db.prepare('SELECT device_id FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)').get(groupInfo.grupo_uuid, nome) as any;
       if (existingUserSession && existingUserSession.device_id !== auxDeviceId) {
+          recordFailedAttempt(clientIp, 'join');
           return socket.emit('group_result', { success: false, msg: 'Usuário já conectado em outro dispositivo.' });
       }
 
@@ -240,6 +257,7 @@ async function startServer() {
         if (groupInfo.privado) {
           const passwordHash = typeof groupInfo.senha_hash === 'string' ? groupInfo.senha_hash : null;
           if (!password || !passwordHash || !bcrypt.compareSync(password, passwordHash)) {
+            recordFailedAttempt(clientIp, 'join');
             return socket.emit('group_result', { success: false, msg: 'Senha incorreta' });
           }
         }
@@ -263,10 +281,16 @@ async function startServer() {
     socket.on('reclaim_admin', (data) => {
         const { grupo_id, session_token, device_id, admin_key } = data;
         const validSession = validateSession(session_token, grupo_id, device_id);
-        if (!validSession) return socket.emit('admin_result', { success: false, msg: 'Sessão inválida' });
+        if (!validSession) {
+          recordFailedAttempt(clientIp, 'admin');
+          return socket.emit('admin_result', { success: false, msg: 'Sessão inválida' });
+        }
         
         const group = db.prepare('SELECT grupo_uuid, admin_key_hash FROM grupos WHERE grupo_id = ?').get(grupo_id) as any;
-        if (!group || !admin_key || !bcrypt.compareSync(admin_key, group.admin_key_hash)) return socket.emit('admin_result', { success: false, msg: 'Chave inválida' });
+        if (!group || !admin_key || !bcrypt.compareSync(admin_key, group.admin_key_hash)) {
+          recordFailedAttempt(clientIp, 'admin');
+          return socket.emit('admin_result', { success: false, msg: 'Chave inválida' });
+        }
         
         db.prepare('UPDATE grupos SET admin_session_token = ? WHERE grupo_uuid = ?').run(session_token, group.grupo_uuid);
         socket.emit('admin_result', { success: true, msg: 'Privilégios recuperados' });
@@ -277,14 +301,19 @@ async function startServer() {
       
       const { grupo_id: grupoId, usuario: nome, recovery_secret, device_id: auxDeviceId } = data;
       const group = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
-      if (!group) return socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
+      if (!group) {
+        recordFailedAttempt(clientIp, 'recovery');
+        return socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
+      }
       
       const existingSession = db.prepare(`SELECT recovery_secret_hash, device_id FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).get(group.grupo_uuid, nome) as any;
       const recoveryHash = typeof existingSession?.recovery_secret_hash === 'string' ? existingSession.recovery_secret_hash : null;
       if (!existingSession || !recovery_secret || !recoveryHash || !bcrypt.compareSync(recovery_secret, recoveryHash)) {
+        recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_result', { success: false, msg: 'Dados inválidos' });
       }
       if (!auxDeviceId || !existingSession.device_id || String(auxDeviceId) !== String(existingSession.device_id)) {
+        recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_result', { success: false, msg: 'Dispositivo inválido para esta recuperação' });
       }
       
@@ -297,11 +326,19 @@ async function startServer() {
       if (!checkRateLimit(clientIp, 'recovery')) return socket.emit('recovery_verified', { success: false, msg: 'Tente mais tarde.' });
       const { token, grupo_id, usuario, device_id } = data;
       const tInfo = temp_tokens[token];
-      if (!tInfo || tInfo.expires < new Date() || tInfo.grupo_id !== grupo_id || tInfo.usuario.toLowerCase() !== usuario.toLowerCase()) return socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
+      if (!tInfo || tInfo.expires < new Date() || tInfo.grupo_id !== grupo_id || tInfo.usuario.toLowerCase() !== usuario.toLowerCase()) {
+        recordFailedAttempt(clientIp, 'recovery');
+        return socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
+      }
       if (!device_id || !tInfo.device_id || String(device_id) !== String(tInfo.device_id)) {
+        recordFailedAttempt(clientIp, 'recovery');
         return socket.emit('recovery_verified', { success: false, msg: 'Dispositivo inválido para este token' });
       }
       const group = db.prepare('SELECT grupo_uuid FROM grupos WHERE grupo_id = ?').get(grupo_id) as any;
+      if (!group) {
+        recordFailedAttempt(clientIp, 'recovery');
+        return socket.emit('recovery_verified', { success: false, msg: 'Grupo não encontrado' });
+      }
       
       db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(group.grupo_uuid, usuario);
       const sessionToken = crypto.randomBytes(32).toString('hex');
@@ -362,10 +399,16 @@ async function startServer() {
       if (!checkRateLimit(clientIp, 'admin')) return socket.emit('group_result', { success: false, msg: 'Tente mais tarde.' });
       
       const validSession = validateSession(data.session_token, data.grupo_id, data.device_id);
-      if (!validSession) return socket.emit('group_result', { success: false, msg: 'Sessão inválida.' });
+      if (!validSession) {
+        recordFailedAttempt(clientIp, 'admin');
+        return socket.emit('group_result', { success: false, msg: 'Sessão inválida.' });
+      }
 
       const group = db.prepare(`SELECT grupo_uuid, admin_session_token FROM grupos WHERE grupo_id = ?`).get(data.grupo_id) as any;
-      if (!group || group.admin_session_token !== data.session_token) return socket.emit('group_result', { success: false, msg: 'Não autorizado.' });
+      if (!group || group.admin_session_token !== data.session_token) {
+        recordFailedAttempt(clientIp, 'admin');
+        return socket.emit('group_result', { success: false, msg: 'Não autorizado.' });
+      }
       
       db.prepare(`DELETE FROM grupos WHERE grupo_uuid = ?`).run(group.grupo_uuid);
       io.to(data.grupo_id).emit('group_deleted', { msg: 'Grupo excluído.' });
