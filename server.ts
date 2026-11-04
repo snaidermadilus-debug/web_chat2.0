@@ -107,15 +107,15 @@ const temp_tokens: Record<string, { grupo_id: string; usuario: string; device_id
 const failed_attempts: Record<string, [number, Date]> = {};
 const INACTIVITY_TIMEOUT = 24 * 60; // 24 hours
 
-function sanitizeInput(text: string, maxLength = 500): string {
-  if (!text) return '';
-  text = text.trim();
-  if (text.length > maxLength) {
-    text = text.substring(0, maxLength);
+function sanitizeInput(text: string | number | null | undefined, maxLength = 500): string {
+  if (text === null || text === undefined) return '';
+  let value = String(text).trim();
+  if (value.length > maxLength) {
+    value = value.substring(0, maxLength);
   }
-  text = text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  text = text.replace(/[\x00-\x1F\x7F]/g, '');
-  return text;
+  value = value.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  value = value.replace(/[\x00-\x1F\x7F]/g, '');
+  return value;
 }
 
 function recordFailedAttempt(ip: string, operation: string) {
