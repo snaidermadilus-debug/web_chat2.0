@@ -233,7 +233,12 @@ async function startServer() {
       }
 
       if (!validSession || validSession.usuario.toLowerCase() !== nome.toLowerCase()) {
-        if (groupInfo.privado && (!password || !bcrypt.compareSync(password, groupInfo.senha_hash))) return socket.emit('group_result', { success: false, msg: 'Senha incorreta' });
+        if (groupInfo.privado) {
+          const passwordHash = typeof groupInfo.senha_hash === 'string' ? groupInfo.senha_hash : null;
+          if (!password || !passwordHash || !bcrypt.compareSync(password, passwordHash)) {
+            return socket.emit('group_result', { success: false, msg: 'Senha incorreta' });
+          }
+        }
         
         activeToken = crypto.randomBytes(32).toString('hex');
         const recoverySecret = crypto.randomBytes(16).toString('hex');
@@ -271,7 +276,8 @@ async function startServer() {
       if (!group) return socket.emit('recovery_result', { success: false, msg: 'Grupo não encontrado' });
       
       const existingSession = db.prepare(`SELECT recovery_secret_hash FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).get(group.grupo_uuid, nome) as any;
-      if (!existingSession || !bcrypt.compareSync(recovery_secret, existingSession.recovery_secret_hash)) return socket.emit('recovery_result', { success: false, msg: 'Dados inválidos' });
+      const recoveryHash = typeof existingSession?.recovery_secret_hash === 'string' ? existingSession.recovery_secret_hash : null;
+      if (!existingSession || !recovery_secret || !recoveryHash || !bcrypt.compareSync(recovery_secret, recoveryHash)) return socket.emit('recovery_result', { success: false, msg: 'Dados inválidos' });
       
       const token = crypto.randomBytes(16).toString('hex');
       temp_tokens[token] = { grupo_id: grupoId, usuario: nome, device_id: auxDeviceId, socket_id: socket.id, expires: new Date(Date.now() + 5 * 60 * 1000) };
@@ -280,11 +286,12 @@ async function startServer() {
 
     socket.on('verify_recovery', (data) => {
       if (!checkRateLimit(clientIp, 'recovery')) return socket.emit('recovery_verified', { success: false, msg: 'Tente mais tarde.' });
-      const { token, grupo_id, usuario } = data;
+      const { token, grupo_id, usuario, device_id } = data;
       const tInfo = temp_tokens[token];
       if (!tInfo || tInfo.expires < new Date() || tInfo.grupo_id !== grupo_id || tInfo.usuario.toLowerCase() !== usuario.toLowerCase()) return socket.emit('recovery_verified', { success: false, msg: 'Token inválido' });
-      
-      delete temp_tokens[token];
+      if (!device_id || !tInfo.device_id || String(device_id) !== String(tInfo.device_id)) {
+        return socket.emit('recovery_verified', { success: false, msg: 'Dispositivo inválido para este token' });
+      }
       const group = db.prepare('SELECT grupo_uuid FROM grupos WHERE grupo_id = ?').get(grupo_id) as any;
       
       db.prepare(`DELETE FROM sessoes WHERE grupo_uuid = ? AND LOWER(usuario) = LOWER(?)`).run(group.grupo_uuid, usuario);
