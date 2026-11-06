@@ -36,10 +36,13 @@ const MAX_MESSAGE_ATTEMPTS = 3;
 const MESSAGE_ACK_TIMEOUT_MS = 5000;
 const MAX_MESSAGES_IN_STATE = 1000;
 
-function mergeMessageWindow(current: Message[], incoming: Message[]) {
+function mergeMessageWindow(current: Message[], incoming: Message[], olderPage = false) {
   const byId = new Map(current.map(message => [message.id, message]));
   incoming.forEach(message => byId.set(message.id, message));
-  return [...byId.values()].sort((left, right) => left.id - right.id).slice(-MAX_MESSAGES_IN_STATE);
+  const messages = [...byId.values()].sort((left, right) => left.id - right.id);
+  return messages.length <= MAX_MESSAGES_IN_STATE
+    ? messages
+    : olderPage ? messages.slice(0, MAX_MESSAGES_IN_STATE) : messages.slice(-MAX_MESSAGES_IN_STATE);
 }
 
 export default function App() {
@@ -50,13 +53,14 @@ export default function App() {
   const [currentGroup, setCurrentGroup] = useState<string>('');
   const [currentUser, setCurrentUser] = useState<string>('');
   const [sessionToken, setSessionToken] = useState<string>('');
-  const [isPrivate, setIsPrivate] = useState<boolean>(false);
   const [isAdmin, setIsAdmin] = useState<boolean>(false);
   const [adminKey, setAdminKey] = useState<string>('');
   const [userCount, setUserCount] = useState<number>(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [historyHasMore, setHistoryHasMore] = useState<boolean>(false);
   const [historyLoading, setHistoryLoading] = useState<boolean>(false);
+  const [isBrowsingHistory, setIsBrowsingHistory] = useState<boolean>(false);
+  const [newMessageCount, setNewMessageCount] = useState<number>(0);
   const [messageDeliveryState, setMessageDeliveryState] = useState<MessageDeliveryState>('idle');
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   
@@ -106,6 +110,7 @@ export default function App() {
   const rejoinPendingRef = useRef<boolean>(false);
   const messagesRef = useRef<Message[]>([]);
   const recoveryAdminKeyRef = useRef<string>('');
+  const reclaimAdminKeyRef = useRef<string>('');
   const pendingMessageRef = useRef<PendingMessage | null>(null);
   const messageRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -113,6 +118,8 @@ export default function App() {
   const historyRequestPendingRef = useRef<boolean>(false);
   const historyRequestGroupRef = useRef<string>('');
   const historyPrependScrollHeightRef = useRef<number | null>(null);
+  const restoringSessionRef = useRef<boolean>(false);
+  const historyViewingOlderRef = useRef<boolean>(false);
 
   useEffect(() => {
     currentGroupRef.current = currentGroup;
@@ -167,6 +174,11 @@ export default function App() {
 
     socket.on('group_result', (data: any) => {
       if (!data.success) {
+        if (restoringSessionRef.current) {
+          restoringSessionRef.current = false;
+          resetChatState();
+          setScreen('options');
+        }
         if (rejoinPendingRef.current) {
           rejoinPendingRef.current = false;
           setConnectionState('failed');
@@ -176,6 +188,7 @@ export default function App() {
       }
 
       rejoinPendingRef.current = false;
+      restoringSessionRef.current = false;
       setConnectionState('connected');
       activeSessionRef.current = {
         grupo_id: data.grupo_id,
@@ -186,7 +199,6 @@ export default function App() {
       setCurrentGroup(data.grupo_id);
       setCurrentUser(data.usuario);
       setSessionToken(data.session_token);
-      setIsPrivate(data.is_private || false);
       setIsAdmin(data.is_admin || false);
       if (data.admin_key) {
         setAdminKey(data.admin_key);
@@ -203,6 +215,9 @@ export default function App() {
 
       setMessages([]);
       messagesRef.current = [];
+      historyViewingOlderRef.current = false;
+      setIsBrowsingHistory(false);
+      setNewMessageCount(0);
       historyBeforeIdRef.current = null;
       historyRequestGroupRef.current = data.grupo_id;
       historyRequestPendingRef.current = true;
@@ -222,10 +237,13 @@ export default function App() {
     socket.on('receive_message', (data: any) => {
       const activeGroup = currentGroupRef.current || localStorage.getItem('chat_session_group');
       if (data.grupo_id === activeGroup) {
+        if (historyViewingOlderRef.current) {
+          setNewMessageCount(count => count + 1);
+          return;
+        }
         const nextMessages = mergeMessageWindow(messagesRef.current, [{ id: Number(data.id), user: data.usuario, msg: data.msg, time: data.timestamp }]);
         messagesRef.current = nextMessages;
         setMessages(nextMessages);
-        if (nextMessages.length >= MAX_MESSAGES_IN_STATE) setHistoryHasMore(false);
       }
     });
 
@@ -240,14 +258,21 @@ export default function App() {
       }
 
       const incomingMessages: Message[] = data.messages || [];
+      const isOlderPage = data.before_id !== null;
       if (data.before_id !== null && chatMessagesRef.current) {
         historyPrependScrollHeightRef.current = chatMessagesRef.current.scrollHeight;
+        historyViewingOlderRef.current = true;
+        setIsBrowsingHistory(true);
+      } else {
+        historyViewingOlderRef.current = false;
+        setIsBrowsingHistory(false);
+        setNewMessageCount(0);
       }
-      const nextMessages = mergeMessageWindow(messagesRef.current, incomingMessages);
+      const nextMessages = mergeMessageWindow(messagesRef.current, incomingMessages, isOlderPage);
       messagesRef.current = nextMessages;
       setMessages(nextMessages);
       historyBeforeIdRef.current = data.next_before_id;
-      setHistoryHasMore(Boolean(data.has_more) && nextMessages.length < MAX_MESSAGES_IN_STATE);
+      setHistoryHasMore(Boolean(data.has_more));
     });
 
     socket.on('message_result', (data: any) => {
@@ -313,11 +338,33 @@ export default function App() {
       });
     });
 
+    socket.on('session_revoked', (data: { reason: 'left' | 'recovered' | 'expired' }) => {
+      resetChatState();
+      setScreen('options');
+      showNotification(
+        data.reason === 'left' ? 'Sua sessão foi encerrada.' :
+          data.reason === 'recovered' ? 'A sessão foi substituída pela recuperação de acesso.' :
+            'Sua sessão expirou por inatividade.',
+        'info'
+      );
+    });
+
+    socket.on('admin_result', (data: { success: boolean; msg: string }) => {
+      if (data.success) {
+        setIsAdmin(true);
+        setAdminKey(reclaimAdminKeyRef.current);
+      }
+      reclaimAdminKeyRef.current = '';
+      showNotification(data.msg, data.success ? 'success' : 'error');
+    });
+
     socket.on('left_group', (data: any) => {
       if (data.success) {
         resetChatState();
         setScreen('options');
         showNotification(data.message || 'Você saiu do grupo', 'info');
+      } else {
+        showNotification(data.msg || 'Não foi possível sair do grupo.', 'error');
       }
     });
 
@@ -469,13 +516,19 @@ export default function App() {
       const saved = localStorage.getItem('chat_session');
       if (saved) {
         const data = JSON.parse(saved);
-        const age = Date.now() - data.timestamp;
-        if (age < 24 * 60 * 60 * 1000) {
+        if (
+          typeof data.grupo_id === 'string' &&
+          typeof data.usuario === 'string' &&
+          typeof data.session_token === 'string' &&
+          typeof data.device_id === 'string' &&
+          data.device_id.length > 0
+        ) {
+          restoringSessionRef.current = true;
           setCurrentGroup(data.grupo_id);
           setCurrentUser(data.usuario);
           setSessionToken(data.session_token);
-          const devId = data.device_id || deviceId;
-          if (data.device_id) setDeviceId(data.device_id);
+          const devId = data.device_id;
+          setDeviceId(devId);
 
           // Automatically rejoin group chat on reload
           const doJoin = () => {
@@ -496,19 +549,30 @@ export default function App() {
           }
         } else {
           localStorage.removeItem('chat_session');
+          localStorage.removeItem('chat_session_group');
         }
       }
     } catch (e) {
       localStorage.removeItem('chat_session');
+      localStorage.removeItem('chat_session_group');
     }
   };
 
   const resetChatState = () => {
+    clearMessageRetryTimer();
+    const hadPendingMessage = pendingMessageRef.current !== null;
+    pendingMessageRef.current = null;
+    setMessageDeliveryState('idle');
+    setMessageInput('');
+    if (hadPendingMessage) {
+      showNotification('Envio pendente cancelado; confira o histórico antes de reenviar.', 'info');
+    }
     setCurrentGroup('');
     setCurrentUser('');
     setSessionToken('');
     setAdminKey('');
     setIsAdmin(false);
+    setRecoverySecret('');
     setUserCount(0);
     setMessages([]);
     messagesRef.current = [];
@@ -520,6 +584,9 @@ export default function App() {
     historyPrependScrollHeightRef.current = null;
     setHistoryHasMore(false);
     setHistoryLoading(false);
+    historyViewingOlderRef.current = false;
+    setIsBrowsingHistory(false);
+    setNewMessageCount(0);
     localStorage.removeItem('chat_session');
     localStorage.removeItem('chat_session_group');
     stopHeartbeat();
@@ -559,6 +626,7 @@ export default function App() {
   };
 
   const handleReclaimAdmin = (adminKey: string) => {
+    reclaimAdminKeyRef.current = adminKey;
     socket?.emit('reclaim_admin', {
       grupo_id: currentGroup,
       session_token: sessionToken,
@@ -599,12 +667,34 @@ export default function App() {
     const beforeId = historyBeforeIdRef.current;
     if (!historyHasMore || beforeId === null || historyRequestPendingRef.current || !socket?.connected) return;
     historyRequestPendingRef.current = true;
+    historyViewingOlderRef.current = true;
+    setIsBrowsingHistory(true);
     setHistoryLoading(true);
     socket.emit('load_history', {
       grupo_id: currentGroup,
       session_token: sessionToken,
       device_id: deviceId,
       before_id: beforeId,
+      limit: 30
+    });
+  };
+
+  const handleReturnToLatest = () => {
+    if (!socket?.connected || historyRequestPendingRef.current) return;
+    historyViewingOlderRef.current = false;
+    setIsBrowsingHistory(false);
+    setNewMessageCount(0);
+    historyBeforeIdRef.current = null;
+    historyRequestGroupRef.current = currentGroup;
+    historyRequestPendingRef.current = true;
+    setHistoryLoading(true);
+    setHistoryHasMore(false);
+    messagesRef.current = [];
+    setMessages([]);
+    socket.emit('load_history', {
+      grupo_id: currentGroup,
+      session_token: sessionToken,
+      device_id: deviceId,
       limit: 30
     });
   };
@@ -688,7 +778,7 @@ export default function App() {
         <div className={`fixed top-6 right-6 z-50 px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 backdrop-blur-xl border border-white/10 animate-bounce ${
           notification.type === 'error' ? 'bg-red-600/90 text-white' :
           notification.type === 'success' ? 'bg-emerald-600/90 text-white' : 'bg-purple-600/90 text-white'
-        }`}>
+        }`} role={notification.type === 'error' ? 'alert' : 'status'} aria-live={notification.type === 'error' ? 'assertive' : 'polite'}>
           {notification.type === 'error' ? <AlertCircle className="w-5 h-5" /> : <CheckCircle className="w-5 h-5" />}
           <span className="font-medium">{notification.msg}</span>
         </div>
@@ -805,8 +895,9 @@ export default function App() {
 
             <div className="space-y-6">
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo (ID)</label>
+                <label htmlFor="create-group-id" className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo (ID)</label>
                 <input
+                  id="create-group-id"
                   type="text"
                   value={createGrupo}
                   onChange={e => setCreateGrupo(e.target.value)}
@@ -818,8 +909,9 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome</label>
+                <label htmlFor="create-user-name" className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome</label>
                 <input
+                  id="create-user-name"
                   type="text"
                   value={createNome}
                   onChange={e => setCreateNome(e.target.value)}
@@ -831,8 +923,9 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha {createPrivate ? '(obrigatória)' : '(opcional)'}</label>
+                <label htmlFor="create-group-password" className="block text-white/90 font-semibold mb-2 text-sm">Senha {createPrivate ? '(obrigatória)' : '(opcional)'}</label>
                 <input
+                  id="create-group-password"
                   type="password"
                   value={createPassword}
                   onChange={e => setCreatePassword(e.target.value)}
@@ -845,6 +938,7 @@ export default function App() {
                    onClick={() => setCreatePrivate(!createPrivate)}>
                 <input
                   type="checkbox"
+                  aria-label="Tornar grupo privado"
                   checked={createPrivate}
                   onChange={e => setCreatePrivate(e.target.checked)}
                   className="w-5 h-5 accent-purple-600 rounded cursor-pointer"
@@ -888,8 +982,9 @@ export default function App() {
 
             <div className="space-y-6">
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo (ID)</label>
+                <label htmlFor="join-group-id" className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo (ID)</label>
                 <input
+                  id="join-group-id"
                   type="text"
                   value={joinGrupo}
                   onChange={e => setJoinGrupo(e.target.value)}
@@ -899,8 +994,9 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome</label>
+                <label htmlFor="join-user-name" className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome</label>
                 <input
+                  id="join-user-name"
                   type="text"
                   value={joinNome}
                   onChange={e => setJoinNome(e.target.value)}
@@ -910,8 +1006,9 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Senha do Grupo</label>
+                <label htmlFor="join-group-password" className="block text-white/90 font-semibold mb-2 text-sm">Senha do Grupo</label>
                 <input
+                  id="join-group-password"
                   type="password"
                   value={joinPassword}
                   onChange={e => setJoinPassword(e.target.value)}
@@ -958,8 +1055,9 @@ export default function App() {
 
             <div className="space-y-5">
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo</label>
+                <label htmlFor="recovery-group-id" className="block text-white/90 font-semibold mb-2 text-sm">Nome do Grupo</label>
                 <input
+                  id="recovery-group-id"
                   type="text"
                   value={recoverGrupo}
                   onChange={e => setRecoverGrupo(e.target.value)}
@@ -969,8 +1067,9 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome no Grupo</label>
+                <label htmlFor="recovery-user-name" className="block text-white/90 font-semibold mb-2 text-sm">Seu Nome no Grupo</label>
                 <input
+                  id="recovery-user-name"
                   type="text"
                   value={recoverNome}
                   onChange={e => setRecoverNome(e.target.value)}
@@ -980,9 +1079,10 @@ export default function App() {
               </div>
 
               <div>
-                <label className="block text-white/90 font-semibold mb-1 text-sm">Chave de Recuperação Pessoal <span className="text-pink-400">*</span></label>
+                <label htmlFor="recovery-secret" className="block text-white/90 font-semibold mb-1 text-sm">Chave de Recuperação Pessoal <span className="text-pink-400">*</span></label>
                 <p className="text-[11px] text-white/50 mb-2">Informe a chave secreta fornecida a você ao entrar no grupo (prova de identidade).</p>
                 <input
+                  id="recovery-secret"
                   type="text"
                   value={recoverSecretInput}
                   onChange={e => setRecoverSecretInput(e.target.value)}
@@ -1010,8 +1110,9 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="block text-white/90 font-semibold mb-2 text-sm">Digite o Token</label>
+                    <label htmlFor="recovery-token" className="block text-white/90 font-semibold mb-2 text-sm">Digite o Token</label>
                     <input
+                      id="recovery-token"
                       type="text"
                       value={recoverToken}
                       onChange={e => setRecoverToken(e.target.value)}
@@ -1022,9 +1123,10 @@ export default function App() {
                   </div>
 
                   <div>
-                    <label className="block text-white/90 font-semibold mb-1 text-sm">Chave de Administrador <span className="text-white/40 font-normal">(opcional)</span></label>
+                    <label htmlFor="recovery-admin-key" className="block text-white/90 font-semibold mb-1 text-sm">Chave de Administrador <span className="text-white/40 font-normal">(opcional)</span></label>
                     <p className="text-[11px] text-white/50 mb-2">Para recuperar os privilégios de administrador do grupo, informe a chave segura gerada na criação.</p>
                     <input
+                      id="recovery-admin-key"
                       type="text"
                       value={recoverAdminKey}
                       onChange={e => setRecoverAdminKey(e.target.value)}
@@ -1059,7 +1161,7 @@ export default function App() {
       {screen === 'chat' && (
         <div className="fixed inset-0 z-50 bg-[#0a0a0a] flex flex-col animate-in fade-in duration-300">
           {/* Chat Header */}
-          <header className="bg-gradient-to-r from-[#1a1a1a] to-[#2d2d2d] text-white px-6 py-4 flex items-center justify-between border-b border-white/10 shadow-2xl backdrop-blur-xl">
+          <header className="bg-gradient-to-r from-[#1a1a1a] to-[#2d2d2d] text-white px-3 sm:px-6 py-3 sm:py-4 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 shadow-2xl backdrop-blur-xl">
             <div className="flex items-center gap-4">
               <div className="flex flex-col">
                 <div className="text-xl font-bold flex items-center gap-2">
@@ -1076,7 +1178,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center justify-end gap-2 sm:gap-3">
               <div className="hidden sm:flex items-center gap-2 bg-purple-500/10 px-4 py-2 rounded-2xl border border-purple-500/30 text-sm font-medium">
                 <span>👤</span>
                 <span>{currentUser}</span>
@@ -1090,6 +1192,7 @@ export default function App() {
               {isAdmin && adminKey && (
                 <button
                   onClick={() => void copyToClipboard(adminKey, 'Chave de Administrador')}
+                    aria-label="Copiar chave de administrador"
                   title="Copiar chave de recuperação do administrador"
                   className="hidden md:flex items-center gap-1.5 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
                 >
@@ -1099,7 +1202,8 @@ export default function App() {
               )}
               <button
                 onClick={() => setKeysModalConfig({ isOpen: true, personalKey: recoverySecret, adminKey: isAdmin ? adminKey : null })}
-                className="hidden sm:flex items-center gap-1.5 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-purple-200 px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
+                aria-label="Abrir chaves de recuperação"
+                className="flex items-center gap-1.5 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/30 text-purple-200 px-2 sm:px-3 py-1.5 rounded-xl text-xs font-medium transition-all cursor-pointer"
               >
                 <Key className="w-3.5 h-3.5 text-purple-300" />
                 <span>Chaves</span>
@@ -1107,24 +1211,26 @@ export default function App() {
               {isAdmin && (
                 <button
                   onClick={handleDeleteGroup}
+                  aria-label="Excluir grupo"
                   className="bg-red-500/10 hover:bg-red-600/30 border border-red-500/30 hover:border-red-500/50 text-red-200 px-4 py-2 rounded-xl font-medium text-sm flex items-center gap-2 transition-all cursor-pointer"
                 >
                   <LogOut className="w-4 h-4 text-red-300" />
-                  <span>Excluir Grupo</span>
+                  <span className="hidden sm:inline">Excluir Grupo</span>
                 </button>
               )}
               <button
                 onClick={handleLeaveGroup}
+                aria-label="Sair do grupo"
                 className="bg-white/10 hover:bg-red-500/20 border border-white/15 hover:border-red-500/40 text-white px-4 py-2.5 rounded-xl font-medium text-sm flex items-center gap-2 transition-all group"
               >
                 <LogOut className="w-4 h-4 text-white/70 group-hover:text-red-400 transition-colors" />
-                <span>Sair</span>
+                <span className="hidden sm:inline">Sair</span>
               </button>
             </div>
           </header>
 
           {/* Messages Feed */}
-          <div ref={chatMessagesRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-gradient-to-b from-[#0a0a0a] to-[#121212]">
+          <div ref={chatMessagesRef} role="log" aria-label="Mensagens do grupo" aria-live="polite" className="flex-1 overflow-y-auto p-6 space-y-4 bg-gradient-to-b from-[#0a0a0a] to-[#121212]">
             {historyHasMore && (
               <div className="flex justify-center">
                 <button
@@ -1133,6 +1239,17 @@ export default function App() {
                   className="px-4 py-2 text-sm text-cyan-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl disabled:opacity-50"
                 >
                   {historyLoading ? 'Carregando...' : 'Carregar mensagens anteriores'}
+                </button>
+              </div>
+            )}
+            {isBrowsingHistory && (
+              <div className="flex justify-center">
+                <button
+                  onClick={handleReturnToLatest}
+                  disabled={historyLoading}
+                  className="px-4 py-2 text-sm text-purple-200 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl disabled:opacity-50"
+                >
+                  {newMessageCount > 0 ? `${newMessageCount} novas mensagens — voltar ao final` : 'Voltar às mensagens recentes'}
                 </button>
               </div>
             )}
@@ -1177,6 +1294,7 @@ export default function App() {
                 {messageDeliveryState === 'failed' && (
                   <button
                     onClick={handleRetryPendingMessage}
+                    aria-label="Tentar enviar a mensagem novamente"
                     className="flex items-center gap-1.5 text-cyan-200 hover:text-white"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />
@@ -1188,7 +1306,9 @@ export default function App() {
             <div className="max-w-4xl mx-auto flex items-center gap-3">
               <input
                 type="text"
+                id="chat-message"
                 value={messageInput}
+                aria-label="Mensagem"
                 onChange={e => setMessageInput(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && messageDeliveryState === 'idle') handleSendMessage(); }}
                 placeholder="Digite sua mensagem..."
@@ -1197,6 +1317,7 @@ export default function App() {
               />
               <button
                 onClick={handleSendMessage}
+                aria-label="Enviar mensagem"
                 disabled={!messageInput.trim() || messageDeliveryState !== 'idle'}
                 className="w-14 h-14 rounded-2xl bg-gradient-to-r from-purple-600 to-cyan-500 text-white flex items-center justify-center shadow-lg hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100 transition-all shrink-0 cursor-pointer"
               >
@@ -1208,9 +1329,9 @@ export default function App() {
       )}
       {/* Modal Confirm */}
       {modalConfig && modalConfig.isOpen && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
           <div className="bg-[#1c1c1e] text-white rounded-3xl p-8 max-w-sm w-full border border-white/10 shadow-2xl">
-            <h2 className="text-xl font-bold mb-3">{modalConfig.title}</h2>
+            <h2 id="confirm-modal-title" className="text-xl font-bold mb-3">{modalConfig.title}</h2>
             <p className="text-white/70 mb-8">{modalConfig.message}</p>
             <div className="flex gap-3">
               <button
@@ -1237,16 +1358,16 @@ export default function App() {
 
       {/* Keys Modal */}
       {keysModalConfig && keysModalConfig.isOpen && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200">
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-[100] backdrop-blur-sm animate-in fade-in duration-200" role="dialog" aria-modal="true" aria-labelledby="keys-modal-title">
           <div className="bg-[#1c1c1e] text-white rounded-3xl p-8 max-w-sm w-full border border-white/10 shadow-2xl">
-            <h2 className="text-xl font-bold mb-6">Suas Chaves</h2>
+            <h2 id="keys-modal-title" className="text-xl font-bold mb-6">Suas Chaves</h2>
             <div className="space-y-6">
               {keysModalConfig.personalKey && (
                 <div>
-                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Pessoal de Recuperação</label>
+                  <div className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Pessoal de Recuperação</div>
                   <div className="flex items-center gap-2 p-3 bg-pink-900/20 border border-pink-500/20 rounded-xl">
                     <span className="font-mono text-pink-300 break-all flex-1">{keysModalConfig.personalKey}</span>
-                    <button onClick={() => void copyToClipboard(keysModalConfig.personalKey!, 'Chave pessoal')} className="text-pink-300 hover:text-white">
+                    <button onClick={() => void copyToClipboard(keysModalConfig.personalKey!, 'Chave pessoal')} aria-label="Copiar chave pessoal de recuperação" className="text-pink-300 hover:text-white">
                       <Copy className="w-5 h-5" />
                     </button>
                   </div>
@@ -1255,10 +1376,10 @@ export default function App() {
               )}
               {keysModalConfig.adminKey && (
                 <div>
-                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Administrativa do Grupo</label>
+                  <div className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Chave Administrativa do Grupo</div>
                   <div className="flex items-center gap-2 p-3 bg-amber-900/20 border border-amber-500/20 rounded-xl">
                     <span className="font-mono text-amber-300 break-all flex-1">{keysModalConfig.adminKey}</span>
-                    <button onClick={() => void copyToClipboard(keysModalConfig.adminKey!, 'Chave de administrador')} className="text-amber-300 hover:text-white">
+                    <button onClick={() => void copyToClipboard(keysModalConfig.adminKey!, 'Chave de administrador')} aria-label="Copiar chave administrativa" className="text-amber-300 hover:text-white">
                       <Copy className="w-5 h-5" />
                     </button>
                   </div>
@@ -1267,8 +1388,8 @@ export default function App() {
               )}
               {!isAdmin && (
                 <div>
-                  <label className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Recuperar Admin</label>
-                  <input type="text" id="adminKeyInput" placeholder="Cole sua chave admin aqui" className="w-full p-3 bg-[#28282d] border border-white/10 rounded-xl text-white font-mono text-xs placeholder-white/30" />
+                  <label htmlFor="adminKeyInput" className="block text-white/70 text-xs mb-2 uppercase tracking-wider">Recuperar Admin</label>
+                  <input type="text" id="adminKeyInput" aria-label="Chave administrativa" placeholder="Cole sua chave admin aqui" className="w-full p-3 bg-[#28282d] border border-white/10 rounded-xl text-white font-mono text-xs placeholder-white/30" />
                   <button onClick={() => {
                       const key = (document.getElementById('adminKeyInput') as HTMLInputElement).value;
                       handleReclaimAdmin(key);

@@ -3,10 +3,36 @@ import { strict as assert } from "assert";
 
 const makeGroupId = (prefix: string) => `${prefix}${Math.random().toString(36).slice(2, 6)}`;
 const makeMessageId = () => `message_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-const waitForEvent = <T = any>(socket: any, eventName: string) => new Promise<T>((resolve) => socket.once(eventName, resolve));
-const waitForGroupCount = (socket: any, grupoId: string) => new Promise<any>((resolve) => {
+const waitForEvent = <T = any>(socket: any, eventName: string) => new Promise<T>((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    socket.off(eventName, listener);
+    reject(new Error(`Timed out waiting for ${eventName}`));
+  }, 10000);
+  const listener = (data: T) => {
+    clearTimeout(timeout);
+    resolve(data);
+  };
+  socket.once(eventName, listener);
+});
+const expectNoEvent = (socket: any, eventName: string, durationMs = 250) => new Promise<boolean>((resolve) => {
+  const listener = () => {
+    clearTimeout(timeout);
+    resolve(false);
+  };
+  const timeout = setTimeout(() => {
+    socket.off(eventName, listener);
+    resolve(true);
+  }, durationMs);
+  socket.once(eventName, listener);
+});
+const waitForGroupCount = (socket: any, grupoId: string) => new Promise<any>((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    socket.off("user_count_update", listener);
+    reject(new Error(`Timed out waiting for user count update for ${grupoId}`));
+  }, 10000);
   const listener = (data: any) => {
     if (data.grupo_id !== grupoId) return;
+    clearTimeout(timeout);
     socket.off("user_count_update", listener);
     resolve(data);
   };
@@ -19,6 +45,7 @@ async function runTests() {
 
   await new Promise<void>(r => socket.on("connect", () => r()));
   console.log("Connected to server.");
+  const db = await import("node:sqlite").then(({ DatabaseSync }) => new DatabaseSync(process.env.DATABASE_PATH || "chat_database.db"));
 
   const testGrp1 = makeGroupId("testgrp1");
   const testGrp2 = makeGroupId("testgrp2");
@@ -145,6 +172,105 @@ async function runTests() {
   assert.strictEqual(res5Verify.device_id, "d15", "Test 5 Failed: device id missing after recovery");
   console.log("Test 5 Passed: successful recovery returns the session metadata needed by the client.");
 
+  // Test 5b: revoked sockets cannot receive later group broadcasts.
+  const revokeGroup = makeGroupId("revoke");
+  const createRevokeGroupPromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: revokeGroup, usuario: "revokeuser", device_id: "revoke-device" });
+  const revokeGroupResult = await createRevokeGroupPromise;
+  const siblingSocket = io("http://localhost:3002");
+  const observerSocket = io("http://localhost:3002");
+  await Promise.all([
+    new Promise<void>(resolve => siblingSocket.once("connect", () => resolve())),
+    new Promise<void>(resolve => observerSocket.once("connect", () => resolve()))
+  ]);
+  const siblingJoinPromise = waitForEvent<any>(siblingSocket, "group_result");
+  siblingSocket.emit("join_group", {
+    grupo_id: revokeGroup,
+    usuario: "revokeuser",
+    session_token: revokeGroupResult.session_token,
+    device_id: "revoke-device"
+  });
+  const siblingJoin = await siblingJoinPromise;
+  assert.strictEqual(siblingJoin.success, true, "Test 5b Failed: second socket could not join with the shared session");
+  const observerJoinPromise = waitForEvent<any>(observerSocket, "group_result");
+  observerSocket.emit("join_group", { grupo_id: revokeGroup, usuario: "observer", device_id: "observer-device" });
+  const observerJoin = await observerJoinPromise;
+  assert.strictEqual(observerJoin.success, true, "Test 5b Failed: observer could not join group");
+
+  const revokedPromise = waitForEvent<any>(siblingSocket, "session_revoked");
+  const leaveRevokeGroupPromise = waitForEvent<any>(socket, "left_group");
+  socket.emit("leave_group", {
+    grupo_id: revokeGroup,
+    session_token: revokeGroupResult.session_token,
+    device_id: "revoke-device"
+  });
+  const leaveResult = await leaveRevokeGroupPromise;
+  const revokedResult = await revokedPromise;
+  assert.strictEqual(leaveResult.success, true, "Test 5b Failed: leaving the group failed");
+  assert.strictEqual(revokedResult.reason, "left", "Test 5b Failed: sibling socket was not notified of revocation");
+
+  const unexpectedMessage = expectNoEvent(siblingSocket, "receive_message");
+  const observerMessagePromise = waitForEvent<any>(observerSocket, "message_result");
+  observerSocket.emit("send_message", {
+    grupo_id: revokeGroup,
+    usuario: "observer",
+    session_token: observerJoin.session_token,
+    device_id: "observer-device",
+    client_msg_id: makeMessageId(),
+    msg: "active member message"
+  });
+  const observerMessage = await observerMessagePromise;
+  assert.strictEqual(observerMessage.success, true, "Test 5b Failed: active member could not send a message");
+  assert.strictEqual(await unexpectedMessage, true, "Test 5b Failed: revoked socket received a group message");
+
+  const revokedSendPromise = waitForEvent<any>(siblingSocket, "message_result");
+  siblingSocket.emit("send_message", {
+    grupo_id: revokeGroup,
+    usuario: "revokeuser",
+    session_token: revokeGroupResult.session_token,
+    device_id: "revoke-device",
+    client_msg_id: makeMessageId(),
+    msg: "must be rejected"
+  });
+  const revokedSend = await revokedSendPromise;
+  assert.strictEqual(revokedSend.success, false, "Test 5b Failed: revoked session could still send messages");
+
+  const staleGroup = makeGroupId("stale");
+  const createStaleGroupPromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: staleGroup, usuario: "staleowner", device_id: "stale-owner-device" });
+  const staleGroupResult = await createStaleGroupPromise;
+  assert.strictEqual(staleGroupResult.success, true, "Test 5b Failed: stale-session regression group could not be created");
+  const staleSiblingJoinPromise = waitForEvent<any>(siblingSocket, "group_result");
+  siblingSocket.emit("join_group", { grupo_id: staleGroup, usuario: "stalesibling", device_id: "stale-sibling-device" });
+  const staleSiblingJoin = await staleSiblingJoinPromise;
+  assert.strictEqual(staleSiblingJoin.success, true, "Test 5b Failed: sibling could not join stale-session regression group");
+  const staleObserverJoinPromise = waitForEvent<any>(observerSocket, "group_result");
+  observerSocket.emit("join_group", { grupo_id: staleGroup, usuario: "staleobserver", device_id: "stale-observer-device" });
+  const staleObserverJoin = await staleObserverJoinPromise;
+  assert.strictEqual(staleObserverJoin.success, true, "Test 5b Failed: observer could not join stale-session regression group");
+
+  db.prepare("DELETE FROM sessoes WHERE session_token = ?").run(staleSiblingJoin.session_token);
+  const staleRevocationPromise = waitForEvent<any>(siblingSocket, "session_revoked");
+  const staleUnexpectedMessage = expectNoEvent(siblingSocket, "receive_message");
+  const staleObserverMessagePromise = waitForEvent<any>(observerSocket, "message_result");
+  observerSocket.emit("send_message", {
+    grupo_id: staleGroup,
+    usuario: "staleobserver",
+    session_token: staleObserverJoin.session_token,
+    device_id: "stale-observer-device",
+    client_msg_id: makeMessageId(),
+    msg: "message after session deletion"
+  });
+  const staleObserverMessage = await staleObserverMessagePromise;
+  const staleRevocation = await staleRevocationPromise;
+  assert.strictEqual(staleObserverMessage.success, true, "Test 5b Failed: active session could not send during stale-session regression");
+  assert.strictEqual(staleRevocation.reason, "expired", "Test 5b Failed: invalid room socket was not revoked");
+  assert.strictEqual(await staleUnexpectedMessage, true, "Test 5b Failed: invalid room socket received a group message");
+
+  siblingSocket.disconnect();
+  observerSocket.disconnect();
+  console.log("Test 5b Passed: revocation blocks sending and stale room sockets cannot receive broadcasts.");
+
   // Test 6: repeated invalid joins must trigger rate limiting
   const testGrp6 = makeGroupId("testgrp6");
   const createGrp6Promise = waitForEvent<any>(socket, "group_result");
@@ -207,7 +333,6 @@ async function runTests() {
   const res8Create: any = await createGroup8Promise;
   assert.strictEqual(res8Create.success, true, "Test 8 Failed: could not create group for orphan cleanup regression");
 
-  const db = await import("node:sqlite").then(({ DatabaseSync }) => new DatabaseSync("chat_database.db"));
   const groupRow = db.prepare(`SELECT grupo_uuid, admin_session_token FROM grupos WHERE grupo_id = ?`).get(testGrp8) as { grupo_uuid: string; admin_session_token: string } | undefined;
   assert.ok(groupRow, "Test 8 Failed: group row not found before cleanup check");
   assert.strictEqual(groupRow.admin_session_token, res8Create.session_token, "Test 8 Failed: creator admin session was not persisted");
@@ -227,6 +352,11 @@ async function runTests() {
   socket.emit("create_group", { grupo_id: testGrp9, usuario: "adminrecover", device_id: "d60" });
   const res9Create: any = await createGroup9Promise;
   assert.strictEqual(res9Create.success, true, "Test 9 Failed: could not create group for admin recovery");
+
+  const missingDeviceDeletePromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("delete_group", { grupo_id: testGrp9, session_token: res9Create.session_token });
+  const missingDeviceDelete = await missingDeviceDeletePromise;
+  assert.strictEqual(missingDeviceDelete.success, false, "Test 9 Failed: admin session was accepted without its device ID");
 
   const requestRecovery9Promise = waitForEvent<any>(socket, "recovery_result");
   socket.emit("request_recovery", {
@@ -467,7 +597,7 @@ async function runTests() {
   }
 
   let ipLimitResult: any;
-  for (let index = 0; index < 46; index++) {
+  for (let index = 0; index < 45; index++) {
     const session = ipSessions[index % ipSessions.length];
     const sendMessagePromise = waitForEvent<any>(socket, "message_result");
     socket.emit("send_message", {
@@ -479,10 +609,25 @@ async function runTests() {
       msg: `ip-burst-${index}`
     });
     ipLimitResult = await sendMessagePromise;
-    assert.strictEqual(ipLimitResult.success, index < 45, `Test 15 Failed: incorrect IP limit at message ${index + 1}`);
+    assert.strictEqual(ipLimitResult.success, index < 42, `Test 15 Failed: incorrect IP limit at message ${index + 1}`);
   }
   assert.match(ipLimitResult.msg, /Limite de envio por IP/);
   console.log("Test 15 Passed: the IP message limit is shared across groups and sessions.");
+
+  // Test 16: group creation attempts are limited even when they fail validation.
+  let createLimitResult: any;
+  for (let index = 0; index < 5; index++) {
+    const createAttemptPromise = waitForEvent<any>(socket, "group_result");
+    socket.emit("create_group", { grupo_id: testGrp15, usuario: "ratelimit", device_id: "ratelimit-device" });
+    createLimitResult = await createAttemptPromise;
+    if (index < 2) {
+      assert.strictEqual(createLimitResult.msg, "Grupo já existe", "Test 16 Failed: valid creation attempt was rejected before the configured limit");
+    } else {
+      assert.strictEqual(createLimitResult.msg, "Tente mais tarde.", "Test 16 Failed: repeated group creation attempts were not limited");
+    }
+  }
+  assert.strictEqual(createLimitResult.msg, "Tente mais tarde.", "Test 16 Failed: repeated group creation attempts were not limited");
+  console.log("Test 16 Passed: group creation attempts are rate limited.");
 
   console.log("All tests passed successfully.");
   process.exit(0);
