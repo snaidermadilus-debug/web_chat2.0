@@ -1,5 +1,6 @@
 import { io } from "socket.io-client";
 import { strict as assert } from "assert";
+import bcrypt from "bcryptjs";
 
 const makeGroupId = (prefix: string) => `${prefix}${Math.random().toString(36).slice(2, 6)}`;
 const makeMessageId = () => `message_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -75,11 +76,50 @@ async function runTests() {
   const secondOnlineCount = await secondOnlineCountPromise;
   assert.strictEqual(secondOnlineCount.count, 2, "Test 0 Failed: room presence did not count the second socket");
 
+  const messageId = makeMessageId();
+  const senderMessagePromise = waitForEvent<any>(socket, "message_result");
+  const participantMessagePromise = waitForEvent<any>(secondSocket, "receive_message");
+  socket.emit("send_message", {
+    grupo_id: privateNoPasswordGroup,
+    usuario: "publicowner",
+    session_token: reuseGroupIdResult.session_token,
+    device_id: "d00",
+    client_msg_id: messageId,
+    msg: "button-send-integration"
+  });
+  const [senderMessage, participantMessage] = await Promise.all([senderMessagePromise, participantMessagePromise]);
+  assert.strictEqual(senderMessage.success, true, "Test 0 Failed: send_message was not acknowledged");
+  assert.strictEqual(senderMessage.client_msg_id, messageId, "Test 0 Failed: message_result did not match the client message");
+  assert.strictEqual(participantMessage.msg, "button-send-integration", "Test 0 Failed: other participant did not receive the message");
+  const sentGroupRow = db.prepare(`SELECT grupo_uuid FROM grupos WHERE grupo_id = ?`).get(privateNoPasswordGroup) as { grupo_uuid: string };
+  const persistedMessage = db.prepare(`SELECT mensagem FROM mensagens WHERE grupo_uuid = ? AND client_msg_id = ?`).get(sentGroupRow.grupo_uuid, messageId) as { mensagem: string } | undefined;
+  assert.strictEqual(persistedMessage?.mensagem, "button-send-integration", "Test 0 Failed: message was not persisted in SQLite");
+
   const disconnectedCountPromise = waitForGroupCount(socket, privateNoPasswordGroup);
   secondSocket.disconnect();
   const disconnectedCount = await disconnectedCountPromise;
   assert.strictEqual(disconnectedCount.count, 1, "Test 0 Failed: room presence was not refreshed after disconnect");
-  console.log("Test 0 Passed: private groups require a password and invalid creation leaves the id available.");
+
+  const publicWithPasswordGroup = makeGroupId("publicWithPassword");
+  const publicWithPasswordPromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: publicWithPasswordGroup, usuario: "publicowner", device_id: "d02", password: "not-private" });
+  const publicWithPasswordResult = await publicWithPasswordPromise;
+  assert.strictEqual(publicWithPasswordResult.success, false, "Test 0 Failed: public group accepted a password");
+  const publicWithoutPasswordPromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: publicWithPasswordGroup, usuario: "publicowner", device_id: "d02" });
+  const publicWithoutPasswordResult = await publicWithoutPasswordPromise;
+  assert.strictEqual(publicWithoutPasswordResult.success, true, "Test 0 Failed: public group without a password could not be created");
+
+  const privateWithPasswordGroup = makeGroupId("privateWithPassword");
+  const privateWithPasswordPromise = waitForEvent<any>(socket, "group_result");
+  socket.emit("create_group", { grupo_id: privateWithPasswordGroup, usuario: "privateowner", device_id: "d03", private: true, password: "private-pass" });
+  const privateWithPasswordResult = await privateWithPasswordPromise;
+  assert.strictEqual(privateWithPasswordResult.success, true, "Test 0 Failed: private group with a password could not be created");
+  const privateGroupRow = db.prepare(`SELECT senha_hash, privado FROM grupos WHERE grupo_id = ?`).get(privateWithPasswordGroup) as { senha_hash: string; privado: number };
+  assert.strictEqual(privateGroupRow.privado, 1, "Test 0 Failed: group with private option was not stored as private");
+  assert.ok(bcrypt.compareSync("private-pass", privateGroupRow.senha_hash), "Test 0 Failed: private group password was not stored as a bcrypt hash");
+
+  console.log("Test 0 Passed: group privacy/password combinations, bcrypt storage, and real-time persisted message delivery work.");
 
   // Test 1: Presenting admin key in join_group should not grant admin.
   const createGroup1Promise = waitForEvent<any>(socket, "group_result");

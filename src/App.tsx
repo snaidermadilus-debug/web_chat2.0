@@ -456,7 +456,7 @@ export default function App() {
     pendingMessage.attempts += 1;
     pendingMessage.status = 'sending';
     setMessageDeliveryState('sending');
-    activeSocket.volatile.emit('send_message', {
+    activeSocket.emit('send_message', {
       grupo_id: pendingMessage.grupoId,
       usuario: pendingMessage.usuario,
       session_token: pendingMessage.sessionToken,
@@ -600,6 +600,10 @@ export default function App() {
     }
     if (createPrivate && !createPassword.trim()) {
       showNotification('Defina uma senha para criar um grupo privado.', 'error');
+      return;
+    }
+    if (!createPrivate && createPassword.trim()) {
+      showNotification('Selecione Grupo Privado para criar um grupo com senha.', 'error');
       return;
     }
     socket?.emit('create_group', {

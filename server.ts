@@ -420,13 +420,17 @@ async function startServer() {
       const grupoId = sanitizeInput(data?.grupo_id || '', 32);
       const usuario = sanitizeInput(data?.usuario || '', 15);
       const password = typeof data?.password === 'string' ? data.password.trim() : '';
-      const isPrivate = Boolean(data?.private);
+      if (data?.private != null && typeof data.private !== 'boolean') {
+        return socket.emit('group_result', { success: false, msg: 'Opção de privacidade inválida.' });
+      }
+      const isPrivate = data?.private === true;
       const deviceId = typeof data?.device_id === 'string' ? data.device_id.trim() : '';
 
       if (!deviceId || !grupoId || !usuario) return socket.emit('group_result', { success: false, msg: 'Dados inválidos' });
       if (deviceId.length > 128) return socket.emit('group_result', { success: false, msg: 'Dispositivo inválido' });
       if (!/^[a-zA-Z0-9_-]{1,32}$/.test(grupoId)) return socket.emit('group_result', { success: false, msg: 'ID do grupo inválido' });
       if (isPrivate && !password) return socket.emit('group_result', { success: false, msg: 'Grupos privados exigem uma senha.' });
+      if (!isPrivate && password) return socket.emit('group_result', { success: false, msg: 'Grupos públicos não podem ter senha. Selecione Grupo Privado.' });
       
       let transactionOpen = false;
       try {
