@@ -40,9 +40,11 @@ const waitForGroupCount = (socket: any, grupoId: string) => new Promise<any>((re
   socket.on("user_count_update", listener);
 });
 
+const TEST_SERVER_URL = `http://localhost:${process.env.TEST_PORT || process.env.PORT || 3000}`;
+
 async function runTests() {
   console.log("Running security tests...");
-  const socket = io("http://localhost:3002");
+  const socket = io(TEST_SERVER_URL);
 
   await new Promise<void>(r => socket.on("connect", () => r()));
   console.log("Connected to server.");
@@ -66,7 +68,7 @@ async function runTests() {
   const firstOnlineCount = await firstOnlineCountPromise;
   assert.strictEqual(firstOnlineCount.count, 1, "Test 0 Failed: room presence did not count the creator");
 
-  const secondSocket = io("http://localhost:3002");
+  const secondSocket = io(TEST_SERVER_URL);
   await new Promise<void>(resolve => secondSocket.once("connect", () => resolve()));
   const secondOnlineCountPromise = waitForGroupCount(socket, privateNoPasswordGroup);
   const secondJoinPromise = waitForEvent<any>(secondSocket, "group_result");
@@ -217,8 +219,8 @@ async function runTests() {
   const createRevokeGroupPromise = waitForEvent<any>(socket, "group_result");
   socket.emit("create_group", { grupo_id: revokeGroup, usuario: "revokeuser", device_id: "revoke-device" });
   const revokeGroupResult = await createRevokeGroupPromise;
-  const siblingSocket = io("http://localhost:3002");
-  const observerSocket = io("http://localhost:3002");
+  const siblingSocket = io(TEST_SERVER_URL);
+  const observerSocket = io(TEST_SERVER_URL);
   await Promise.all([
     new Promise<void>(resolve => siblingSocket.once("connect", () => resolve())),
     new Promise<void>(resolve => observerSocket.once("connect", () => resolve()))

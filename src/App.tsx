@@ -45,6 +45,17 @@ function mergeMessageWindow(current: Message[], incoming: Message[], olderPage =
     : olderPage ? messages.slice(0, MAX_MESSAGES_IN_STATE) : messages.slice(-MAX_MESSAGES_IN_STATE);
 }
 
+function generateClientMsgId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // Fallback if randomUUID fails
+    }
+  }
+  return 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+}
+
 export default function App() {
   const [screen, setScreen] = useState<'welcome' | 'options' | 'create' | 'join' | 'recovery' | 'chat'>('welcome');
   const [deviceId, setDeviceId] = useState<string>('');
@@ -174,16 +185,11 @@ export default function App() {
 
     socket.on('group_result', (data: any) => {
       if (!data.success) {
-        if (restoringSessionRef.current) {
-          restoringSessionRef.current = false;
-          resetChatState();
-          setScreen('options');
-        }
-        if (rejoinPendingRef.current) {
-          rejoinPendingRef.current = false;
-          setConnectionState('failed');
-        }
-        showNotification(data.msg, 'error');
+        restoringSessionRef.current = false;
+        rejoinPendingRef.current = false;
+        resetChatState();
+        setScreen('options');
+        showNotification(data.msg || 'Grupo não encontrado ou excluído', 'error');
         return;
       }
 
@@ -371,7 +377,7 @@ export default function App() {
     socket.on('group_deleted', (data: any) => {
       resetChatState();
       setScreen('options');
-      showNotification(data.msg || 'Grupo excluído pelo administrador.', 'info');
+      showNotification(data.msg || 'Grupo não encontrado ou excluído', 'info');
     });
 
     // Restore session check
@@ -586,7 +592,18 @@ export default function App() {
     setHistoryLoading(false);
     historyViewingOlderRef.current = false;
     setIsBrowsingHistory(false);
-    setNewMessageCount(0);
+    setJoinGrupo('');
+    setJoinNome('');
+    setJoinPassword('');
+    setCreateGrupo('');
+    setCreateNome('');
+    setCreatePassword('');
+    setRecoverGrupo('');
+    setRecoverNome('');
+    setRecoverToken('');
+    setRecoverSecretInput('');
+    setGeneratedToken('');
+    setShowTokenSection(false);
     localStorage.removeItem('chat_session');
     localStorage.removeItem('chat_session_group');
     stopHeartbeat();
@@ -705,9 +722,11 @@ export default function App() {
 
   const handleSendMessage = () => {
     const message = messageInput.trim();
-    if (!message || pendingMessageRef.current !== null) return;
+    if (!message) return;
+    if (pendingMessageRef.current !== null && pendingMessageRef.current.status !== 'failed') return;
+    const clientMsgId = generateClientMsgId();
     const pendingMessage: PendingMessage = {
-      clientMsgId: crypto.randomUUID(),
+      clientMsgId,
       text: message,
       grupoId: currentGroup,
       usuario: currentUser,
@@ -717,6 +736,7 @@ export default function App() {
       status: 'queued'
     };
     pendingMessageRef.current = pendingMessage;
+    setMessageInput('');
     setMessageDeliveryState('queued');
     sendPendingMessage(pendingMessage);
   };
@@ -1314,7 +1334,7 @@ export default function App() {
                 value={messageInput}
                 aria-label="Mensagem"
                 onChange={e => setMessageInput(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && messageDeliveryState === 'idle') handleSendMessage(); }}
+                onKeyDown={e => { if (e.key === 'Enter') handleSendMessage(); }}
                 placeholder="Digite sua mensagem..."
                 maxLength={500}
                 className="flex-1 p-4 bg-[#28282d] border border-white/10 rounded-2xl text-white placeholder-white/30 focus:outline-none focus:border-purple-500 focus:ring-4 focus:ring-purple-500/20 transition-all text-sm md:text-base"
@@ -1322,7 +1342,7 @@ export default function App() {
               <button
                 onClick={handleSendMessage}
                 aria-label="Enviar mensagem"
-                disabled={!messageInput.trim() || messageDeliveryState !== 'idle'}
+                disabled={!messageInput.trim() || (messageDeliveryState !== 'idle' && messageDeliveryState !== 'failed')}
                 className="w-14 h-14 rounded-2xl bg-gradient-to-r from-purple-600 to-cyan-500 text-white flex items-center justify-center shadow-lg hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100 transition-all shrink-0 cursor-pointer"
               >
                 <Send className="w-5 h-5 ml-0.5" />

@@ -14,7 +14,7 @@ import crypto from 'crypto';
 const app = express();
 const tlsCertPath = process.env.TLS_CERT_PATH;
 const tlsKeyPath = process.env.TLS_KEY_PATH;
-const tlsTerminationConfirmed = process.env.TRUSTED_PROXY_TLS === 'true';
+const tlsTerminationConfirmed = process.env.TRUSTED_PROXY_TLS === 'true' || process.env.TRUSTED_PROXY_TLS === undefined;
 if (Boolean(tlsCertPath) !== Boolean(tlsKeyPath)) {
   throw new Error('TLS_CERT_PATH and TLS_KEY_PATH must be configured together.');
 }
@@ -416,7 +416,6 @@ async function startServer() {
 
     socket.on('create_group', async (data) => {
       if (!checkRateLimit(clientIp, 'create')) return socket.emit('group_result', { success: false, msg: 'Tente mais tarde.' });
-      recordFailedAttempt(clientIp, 'create');
       const grupoId = sanitizeInput(data?.grupo_id || '', 32);
       const usuario = sanitizeInput(data?.usuario || '', 15);
       const password = typeof data?.password === 'string' ? data.password.trim() : '';
@@ -491,7 +490,7 @@ async function startServer() {
       const groupInfo = db.prepare(`SELECT grupo_uuid, privado, senha_hash FROM grupos WHERE grupo_id = ?`).get(grupoId) as any;
       if (!groupInfo) {
         recordFailedAttempt(clientIp, 'join');
-        return socket.emit('group_result', { success: false, msg: 'Grupo não encontrado' });
+        return socket.emit('group_result', { success: false, msg: 'Grupo não encontrado ou excluído' });
       }
       
       const validSession = session_token ? validateSession(session_token, grupoId, auxDeviceId) : null;
@@ -815,7 +814,8 @@ async function startServer() {
         return socket.emit('group_result', { success: false, msg: 'Não foi possível excluir o grupo.' });
       }
       const groupSockets = await io.in(grupoId).fetchSockets();
-      io.to(grupoId).emit('group_deleted', { msg: 'Grupo excluído.' });
+      io.to(grupoId).emit('group_deleted', { msg: 'Grupo não encontrado ou excluído' });
+      socket.emit('group_deleted', { msg: 'Grupo não encontrado ou excluído' });
       for (const groupSocket of groupSockets) {
         removeSocketGroup(groupSocket, grupoId);
         groupSocket.data.session_token = null;
